@@ -1,0 +1,12 @@
+gunicorn
+ccxt>=4.4.92
+requests
+flask
+python-dateutil
+pytz
+numpy
+python-telegram-bot
+pandas
+TA-Lib
+redis
+python-dotenv

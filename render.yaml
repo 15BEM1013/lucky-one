@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: binance-pattern-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: your_telegram_bot_token
+      - key: CHAT_ID
+        value: your_telegram_chat_id

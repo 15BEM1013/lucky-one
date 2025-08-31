@@ -21,8 +21,8 @@ TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 1.0
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS = 5  # Reduced from 10
-BATCH_DELAY = 2.0  # Increased from 1.0
+MAX_WORKERS = 5
+BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
@@ -39,20 +39,20 @@ RSI_PERIOD = 14
 RSI_OVERBOUGHT = 80
 RSI_OVERSOLD = 30
 BODY_SIZE_THRESHOLD = 0.1
-SUMMARY_INTERVAL = 3600  # 1 hour in seconds
+SUMMARY_INTERVAL = 3600
 
 # === PROXY CONFIGURATION ===
 PROXY_LIST = [
-    {'host': '23.95.150.145', 'port': '6114', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '198.23.239.134', 'port': '6540', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '45.38.107.97', 'port': '6014', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '107.172.163.27', 'port': '6543', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '64.137.96.74', 'port': '6641', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '45.43.186.39', 'port': '6257', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '154.203.43.247', 'port': '5536', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '216.10.27.159', 'port': '6837', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '136.0.207.84', 'port': '6661', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
-    {'host': '142.147.128.93', 'port': '6593', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '23.95.150.145', 'port': '6114', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '198.23.239.134', 'port': '6540', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '45.38.107.97', 'port': '6014', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '107.172.163.27', 'port': '6543', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '64.137.96.74', 'port': '6641', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '45.43.186.39', 'port': '6257', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '154.203.43.247', 'port': '5536', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '216.10.27.159', 'port': '6837', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '136.0.207.84', 'port': '6661', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '142.147.128.93', 'port': '6593', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
 ]
 
 def get_proxy_config(proxy):
@@ -141,7 +141,6 @@ def edit_telegram_message(message_id, new_text):
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Custom session for exchange
 def initialize_exchange():
     for proxy in PROXY_LIST:
         try:
@@ -156,30 +155,37 @@ def initialize_exchange():
                 'enableRateLimit': True,
                 'session': session
             })
-            # Test connection by fetching markets
             exchange.load_markets()
             logging.info(f"Successfully connected using proxy: {proxy['host']}:{proxy['port']}")
-            return exchange, proxies  # Return both exchange and the working proxies
+            return exchange, proxies
         except Exception as e:
             logging.error(f"Failed to connect with proxy {proxy['host']}:{proxy['port']}: {e}")
             continue
-    logging.error("All proxies failed. Exiting.")
-    raise Exception("All proxies failed to connect.")
+    logging.error("All proxies failed. Falling back to direct connection.")
+    try:
+        exchange = ccxt.binance({
+            'options': {'defaultType': 'future'},
+            'enableRateLimit': True
+        })
+        exchange.load_markets()
+        logging.info("Successfully connected using direct connection.")
+        return exchange, None
+    except Exception as e:
+        logging.error(f"Direct connection failed: {e}")
+        raise Exception("All proxies and direct connection failed.")
 
 app = Flask(__name__)
 
 sent_signals = {}
 open_trades = {}
 closed_trades = []
-last_summary_time = 0  # Track last summary time
+last_summary_time = 0
 
 try:
-    exchange, proxies = initialize_exchange()  # Now returns proxies as well
+    exchange, proxies = initialize_exchange()
 except Exception as e:
     logging.error(f"Failed to initialize exchange: {e}")
     exit(1)
-
-# Note: The send_telegram and edit_telegram_message functions use the global 'proxies' which is now set to the working one.
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -407,7 +413,7 @@ def process_symbol(symbol, alert_queue):
                 time.sleep(0.5)
             except ccxt.NetworkError as e:
                 print(f"Network error on {symbol}: {e}")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
                 continue
 
         ema21 = calculate_ema(candles, period=21)
@@ -753,7 +759,7 @@ def run_bot():
     global last_summary_time
     load_trades()
     num_open = len(open_trades)
-    last_summary_time = time.time()  # Initialize at startup
+    last_summary_time = time.time()
     startup_msg = f"BOT STARTED\nNumber of open trades: {num_open}"
     send_telegram(startup_msg)
     threading.Thread(target=scan_loop, daemon=True).start()

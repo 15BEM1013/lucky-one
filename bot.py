@@ -42,14 +42,24 @@ BODY_SIZE_THRESHOLD = 0.1
 SUMMARY_INTERVAL = 3600  # 1 hour in seconds
 
 # === PROXY CONFIGURATION ===
-PROXY_HOST = '45.38.107.97'
-PROXY_PORT = '6014'
-PROXY_USERNAME = 'swpvlbvt'
-PROXY_PASSWORD = '1p357wvgggm2'
-proxies = {
-    "http": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}",
-    "https": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
-}
+PROXY_LIST = [
+    {'host': '23.95.150.145', 'port': '6114', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '198.23.239.134', 'port': '6540', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '45.38.107.97', 'port': '6014', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '107.172.163.27', 'port': '6543', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '64.137.96.74', 'port': '6641', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '45.43.186.39', 'port': '6257', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '154.203.43.247', 'port': '5536', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '216.10.27.159', 'port': '6837', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '136.0.207.84', 'port': '6661', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+    {'host': '142.147.128.93', 'port': '6593', 'username': 'swpvlbvt', 'password': '1p357wvgggm2'},
+]
+
+def get_proxy_config(proxy):
+    return {
+        "http": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}",
+        "https": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+    }
 
 # === CONFIGURE LOGGING ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -132,22 +142,44 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # Custom session for exchange
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+def initialize_exchange():
+    for proxy in PROXY_LIST:
+        try:
+            proxies = get_proxy_config(proxy)
+            logging.info(f"Trying proxy: {proxy['host']}:{proxy['port']}")
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+            exchange = ccxt.binance({
+                'options': {'defaultType': 'future'},
+                'proxies': proxies,
+                'enableRateLimit': True,
+                'session': session
+            })
+            # Test connection by fetching markets
+            exchange.load_markets()
+            logging.info(f"Successfully connected using proxy: {proxy['host']}:{proxy['port']}")
+            return exchange, proxies  # Return both exchange and the working proxies
+        except Exception as e:
+            logging.error(f"Failed to connect with proxy {proxy['host']}:{proxy['port']}: {e}")
+            continue
+    logging.error("All proxies failed. Exiting.")
+    raise Exception("All proxies failed to connect.")
 
-exchange = ccxt.binance({
-    'options': {'defaultType': 'future'},
-    'proxies': proxies,
-    'enableRateLimit': True,
-    'session': session
-})
 app = Flask(__name__)
 
 sent_signals = {}
 open_trades = {}
 closed_trades = []
 last_summary_time = 0  # Track last summary time
+
+try:
+    exchange, proxies = initialize_exchange()  # Now returns proxies as well
+except Exception as e:
+    logging.error(f"Failed to initialize exchange: {e}")
+    exit(1)
+
+# Note: The send_telegram and edit_telegram_message functions use the global 'proxies' which is now set to the working one.
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]

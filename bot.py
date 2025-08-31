@@ -21,8 +21,8 @@ TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 1.0
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS = 10
-BATCH_DELAY = 1.0
+MAX_WORKERS = 5  # Reduced from 10
+BATCH_DELAY = 2.0  # Increased from 1.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
@@ -128,10 +128,19 @@ def edit_telegram_message(message_id, new_text):
         print(f"Edit error: {e}")
 
 # === INIT ===
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Custom session for exchange
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+
 exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
     'proxies': proxies,
-    'enableRateLimit': True
+    'enableRateLimit': True,
+    'session': session
 })
 app = Flask(__name__)
 
@@ -357,12 +366,17 @@ def check_tp_sl():
 def process_symbol(symbol, alert_queue):
     try:
         for attempt in range(3):
-            candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
-            if len(candles) < 25:
-                return
-            if attempt < 2 and candles[-1][0] > candles[-2][0]:
-                break
-            time.sleep(1)
+            try:
+                candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+                if len(candles) < 25:
+                    return
+                if attempt < 2 and candles[-1][0] > candles[-2][0]:
+                    break
+                time.sleep(0.5)
+            except ccxt.NetworkError as e:
+                print(f"Network error on {symbol}: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
 
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
@@ -473,7 +487,7 @@ def process_symbol(symbol, alert_queue):
     except ccxt.RateLimitExceeded:
         time.sleep(5)
     except Exception as e:
-        print(f"Error on {symbol}: {e}")
+        logging.error(f"Error on {symbol}: {e}")
 
 # === PROCESS BATCH ===
 def process_batch(symbols, alert_queue):

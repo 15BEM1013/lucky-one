@@ -1,4 +1,3 @@
-
 import ccxt
 import time
 import threading
@@ -14,8 +13,6 @@ import os
 import talib
 import numpy as np
 import logging
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # === CONFIG ===
 BOT_TOKEN = '7402265241:AAHRDxd12LRizl1qTsQggEEoJ-BeWME3ERo'
@@ -24,8 +21,8 @@ TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 1.0
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS = 5
-BATCH_DELAY = 2.0
+MAX_WORKERS = 5  # Reduced from 10
+BATCH_DELAY = 2.0  # Increased from 1.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
@@ -45,18 +42,14 @@ BODY_SIZE_THRESHOLD = 0.1
 SUMMARY_INTERVAL = 3600  # 1 hour in seconds
 
 # === PROXY CONFIGURATION ===
-PROXY_LIST = [
-    {'host': '23.95.150.145', 'port': '6114', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Buffalo'},
-    {'host': '198.23.239.134', 'port': '6540', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Buffalo'},
-    {'host': '45.38.107.97', 'port': '6014', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Buffalo'},
-    {'host': '107.172.163.27', 'port': '6543', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United Kingdom, London'},
-    {'host': '64.137.96.74', 'port': '6641', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Bloomingdale'},
-    {'host': '45.43.186.39', 'port': '6257', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'Spain, Madrid'},
-    {'host': '154.203.43.247', 'port': '5536', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'Spain, Madrid'},
-    {'host': '216.10.27.159', 'port': '6837', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'Japan, Chiyoda City'},
-    {'host': '136.0.207.84', 'port': '6661', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Dallas'},
-    {'host': '142.147.128.93', 'port': '6593', 'username': 'swpvlbvt', 'password': '1p357wvgggm2', 'location': 'United States, Orem'},
-]
+PROXY_HOST = '45.38.107.97'
+PROXY_PORT = '6014'
+PROXY_USERNAME = 'swpvlbvt'
+PROXY_PASSWORD = '1p357wvgggm2'
+proxies = {
+    "http": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}",
+    "https": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+}
 
 # === CONFIGURE LOGGING ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -74,9 +67,9 @@ def save_trades():
     try:
         with open(TRADE_FILE, 'w') as f:
             json.dump(open_trades, f, default=str)
-        logging.info(f"Trades saved to {TRADE_FILE}")
+        print(f"Trades saved to {TRADE_FILE}")
     except Exception as e:
-        logging.error(f"Error saving trades: {e}")
+        print(f"Error saving trades: {e}")
 
 def load_trades():
     global open_trades
@@ -85,9 +78,9 @@ def load_trades():
             with open(TRADE_FILE, 'r') as f:
                 loaded = json.load(f)
                 open_trades = {k: v for k, v in loaded.items()}
-            logging.info(f"Loaded {len(open_trades)} trades from {TRADE_FILE}")
+            print(f"Loaded {len(open_trades)} trades from {TRADE_FILE}")
     except Exception as e:
-        logging.error(f"Error loading trades: {e}")
+        print(f"Error loading trades: {e}")
         open_trades = {}
 
 def save_closed_trades(closed_trade):
@@ -99,9 +92,9 @@ def save_closed_trades(closed_trade):
         all_closed_trades.append(closed_trade)
         with open(CLOSED_TRADE_FILE, 'w') as f:
             json.dump(all_closed_trades, f, default=str)
-        logging.info(f"Closed trade saved to {CLOSED_TRADE_FILE}")
+        print(f"Closed trade saved to {CLOSED_TRADE_FILE}")
     except Exception as e:
-        logging.error(f"Error saving closed trades: {e}")
+        print(f"Error saving closed trades: {e}")
 
 def load_closed_trades():
     try:
@@ -110,52 +103,51 @@ def load_closed_trades():
                 return json.load(f)
         return []
     except Exception as e:
-        logging.error(f"Error loading closed trades: {e}")
+        print(f"Error loading closed trades: {e}")
         return []
 
 # === TELEGRAM ===
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {'chat_id': CHAT_ID, 'text': msg}
-    for proxy in PROXY_LIST:
-        proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-        proxies = {"http": proxy_url, "https": proxy_url}
-        try:
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(max_retries=retries))
-            response = session.post(url, data=data, timeout=5, proxies=proxies).json()
-            logging.info(f"Telegram sent with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {msg}")
-            return response.get('result', {}).get('message_id')
-        except requests.RequestException as e:
-            logging.error(f"Telegram error with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {e}")
-            continue
-    logging.error("All proxies failed for Telegram message")
-    return None
+    try:
+        response = requests.post(url, data=data, timeout=5, proxies=proxies).json()
+        print(f"Telegram sent: {msg}")
+        return response.get('result', {}).get('message_id')
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return None
 
 def edit_telegram_message(message_id, new_text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     data = {'chat_id': CHAT_ID, 'message_id': message_id, 'text': new_text}
-    for proxy in PROXY_LIST:
-        proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-        proxies = {"http": proxy_url, "https": proxy_url}
-        try:
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(max_retries=retries))
-            session.post(url, data=data, timeout=5, proxies=proxies)
-            logging.info(f"Telegram updated with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {new_text}")
-            return
-        except requests.RequestException as e:
-            logging.error(f"Edit error with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {e}")
-            continue
-    logging.error("All proxies failed for Telegram edit")
+    try:
+        requests.post(url, data=data, timeout=5, proxies=proxies)
+        print(f"Telegram updated: {new_text}")
+    except Exception as e:
+        print(f"Edit error: {e}")
 
 # === INIT ===
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Custom session for exchange
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+
+exchange = ccxt.binance({
+    'options': {'defaultType': 'future'},
+    'proxies': proxies,
+    'enableRateLimit': True,
+    'session': session
+})
+app = Flask(__name__)
+
 sent_signals = {}
 open_trades = {}
 closed_trades = []
-last_summary_time = 0
+last_summary_time = 0  # Track last summary time
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -221,7 +213,7 @@ def round_price(symbol, price):
         precision = int(round(-math.log10(tick_size)))
         return round(price, precision)
     except Exception as e:
-        logging.error(f"Error rounding price for {symbol}: {e}")
+        print(f"Error rounding price for {symbol}: {e}")
         return price
 
 # === PATTERN DETECTION ===
@@ -259,27 +251,8 @@ def detect_falling_three(candles):
 
 # === SYMBOLS ===
 def get_symbols():
-    for proxy in PROXY_LIST:
-        proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-        proxies = {"http": proxy_url, "https": proxy_url}
-        try:
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
-            exchange = ccxt.binance({
-                'options': {'defaultType': 'future'},
-                'proxies': proxies,
-                'enableRateLimit': True,
-                'session': session
-            })
-            markets = exchange.load_markets()
-            logging.info(f"Loaded markets with proxy {proxy['host']}:{proxy['port']} ({proxy['location']})")
-            return [s for s in markets if 'USDT' in s and markets[s]['contract'] and markets[s].get('active') and markets[s].get('info', {}).get('status') == 'TRADING']
-        except ccxt.NetworkError as e:
-            logging.error(f"Failed to load markets with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {e}")
-            continue
-    logging.error("All proxies failed to load markets")
-    return []
+    markets = exchange.load_markets()
+    return [s for s in markets if 'USDT' in s and markets[s]['contract'] and markets[s].get('active') and markets[s].get('info', {}).get('status') == 'TRADING']
 
 # === CANDLE CLOSE ===
 def get_next_candle_close():
@@ -301,68 +274,49 @@ def check_tp_sl():
                         hit = ""
                         pnl = 0
                         hit_price = None
-                        entry_time = trade.get('entry_time')
-                        for proxy in PROXY_LIST:
-                            proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-                            proxies = {"http": proxy_url, "https": proxy_url}
-                            try:
-                                session = requests.Session()
-                                retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-                                session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
-                                exchange = ccxt.binance({
-                                    'options': {'defaultType': 'future'},
-                                    'proxies': proxies,
-                                    'enableRateLimit': True,
-                                    'session': session
-                                })
-                                if entry_time:
-                                    candles_1m = exchange.fetch_ohlcv(sym, '1m', since=entry_time, limit=2880)
-                                    for c in candles_1m:
-                                        high = c[2]
-                                        low = c[3]
-                                        if trade['side'] == 'buy':
-                                            if high >= trade['tp']:
-                                                hit = "✅ TP hit"
-                                                hit_price = trade['tp']
-                                                break
-                                            if low <= trade['sl']:
-                                                hit = "❌ SL hit"
-                                                hit_price = trade['sl']
-                                                break
-                                        else:
-                                            if low <= trade['tp']:
-                                                hit = "✅ TP hit"
-                                                hit_price = trade['tp']
-                                                break
-                                            if high >= trade['sl']:
-                                                hit = "❌ SL hit"
-                                                hit_price = trade['sl']
-                                                break
 
-                                if not hit:
-                                    ticker = exchange.fetch_ticker(sym)
-                                    last = round_price(sym, ticker['last'])
-                                    if trade['side'] == 'buy':
-                                        if last >= trade['tp']:
-                                            hit = "✅ TP hit"
-                                            hit_price = trade['tp']
-                                        elif last <= trade['sl']:
-                                            hit = "❌ SL hit"
-                                            hit_price = trade['sl']
-                                    else:
-                                        if last <= trade['tp']:
-                                            hit = "✅ TP hit"
-                                            hit_price = trade['tp']
-                                        elif last >= trade['sl']:
-                                            hit = "❌ SL hit"
-                                            hit_price = trade['sl']
-                                break  # Exit proxy loop on success
-                            except ccxt.NetworkError as e:
-                                logging.error(f"TP/SL check failed for {sym} with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {e}")
-                                continue
+                        entry_time = trade.get('entry_time')
+                        if entry_time:
+                            candles_1m = exchange.fetch_ohlcv(sym, '1m', since=entry_time, limit=2880)
+                            for c in candles_1m:
+                                high = c[2]
+                                low = c[3]
+                                if trade['side'] == 'buy':
+                                    if high >= trade['tp']:
+                                        hit = "✅ TP hit"
+                                        hit_price = trade['tp']
+                                        break
+                                    if low <= trade['sl']:
+                                        hit = "❌ SL hit"
+                                        hit_price = trade['sl']
+                                        break
+                                else:
+                                    if low <= trade['tp']:
+                                        hit = "✅ TP hit"
+                                        hit_price = trade['tp']
+                                        break
+                                    if high >= trade['sl']:
+                                        hit = "❌ SL hit"
+                                        hit_price = trade['sl']
+                                        break
+
                         if not hit:
-                            logging.error(f"All proxies failed for TP/SL check on {sym}")
-                            continue
+                            ticker = exchange.fetch_ticker(sym)
+                            last = round_price(sym, ticker['last'])
+                            if trade['side'] == 'buy':
+                                if last >= trade['tp']:
+                                    hit = "✅ TP hit"
+                                    hit_price = trade['tp']
+                                elif last <= trade['sl']:
+                                    hit = "❌ SL hit"
+                                    hit_price = trade['sl']
+                            else:
+                                if last <= trade['tp']:
+                                    hit = "✅ TP hit"
+                                    hit_price = trade['tp']
+                                elif last >= trade['sl']:
+                                    hit = "❌ SL hit"
+                                    hit_price = trade['sl']
 
                         if hit:
                             if trade['side'] == 'buy':
@@ -412,37 +366,17 @@ def check_tp_sl():
 def process_symbol(symbol, alert_queue):
     try:
         for attempt in range(3):
-            for proxy in PROXY_LIST:
-                proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-                proxies = {"http": proxy_url, "https": proxy_url}
-                try:
-                    session = requests.Session()
-                    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-                    session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
-                    exchange = ccxt.binance({
-                        'options': {'defaultType': 'future'},
-                        'proxies': proxies,
-                        'enableRateLimit': True,
-                        'session': session
-                    })
-                    candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
-                    if len(candles) < 25:
-                        return
-                    if attempt < 2 and candles[-1][0] > candles[-2][0]:
-                        break
-                    time.sleep(0.5)
-                    break  # Exit proxy loop on success
-                except ccxt.NetworkError as e:
-                    logging.error(f"Network error on {symbol} with proxy {proxy['host']}:{proxy['port']} ({proxy['location']}): {e}")
-                    continue
-            else:
-                logging.error(f"All proxies failed for {symbol} on attempt {attempt + 1}")
-                time.sleep(2 ** attempt)
+            try:
+                candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+                if len(candles) < 25:
+                    return
+                if attempt < 2 and candles[-1][0] > candles[-2][0]:
+                    break
+                time.sleep(0.5)
+            except ccxt.NetworkError as e:
+                print(f"Network error on {symbol}: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
                 continue
-            break
-        else:
-            logging.error(f"Failed to fetch candles for {symbol} after {attempt + 1} attempts")
-            return
 
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
@@ -567,10 +501,7 @@ def scan_loop():
     global closed_trades, last_summary_time
     load_trades()
     symbols = get_symbols()
-    if not symbols:
-        logging.error("No symbols loaded, exiting scan loop")
-        return
-    logging.info(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
+    print(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
     alert_queue = queue.Queue()
 
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
@@ -656,18 +587,18 @@ def scan_loop():
     while True:
         next_close = get_next_candle_close()
         wait_time = max(0, next_close - time.time())
-        logging.info(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
+        print(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
         time.sleep(wait_time)
 
         for i, chunk in enumerate(symbol_chunks):
-            logging.info(f"Processing batch {i+1}/{NUM_CHUNKS}...")
+            print(f"Processing batch {i+1}/{NUM_CHUNKS}...")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
 
-        logging.info("✅ Scan complete.")
+        print("✅ Scan complete.")
         num_open = len(open_trades)
-        logging.info(f"📊 Number of open trades: {num_open}")
+        print(f"📊 Number of open trades: {num_open}")
 
         current_time = time.time()
         if current_time - last_summary_time >= SUMMARY_INTERVAL:
@@ -781,8 +712,6 @@ def scan_loop():
             closed_trades = []
 
 # === FLASK ===
-app = Flask(__name__)
-
 @app.route('/')
 def home():
     return "✅ Rising & Falling Three Pattern Bot is Live!"
@@ -792,7 +721,7 @@ def run_bot():
     global last_summary_time
     load_trades()
     num_open = len(open_trades)
-    last_summary_time = time.time()
+    last_summary_time = time.time()  # Initialize at startup
     startup_msg = f"BOT STARTED\nNumber of open trades: {num_open}"
     send_telegram(startup_msg)
     threading.Thread(target=scan_loop, daemon=True).start()

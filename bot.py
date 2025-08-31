@@ -44,8 +44,8 @@ SUMMARY_INTERVAL = 3600  # 1 hour in seconds
 # === PROXY CONFIGURATION ===
 PROXY_HOST = '45.38.107.97'
 PROXY_PORT = '6014'
-PROXY_USERNAME = 'xlgrzqki'
-PROXY_PASSWORD = 'afvurlw3oeor'
+PROXY_USERNAME = 'octxnfvk'
+PROXY_PASSWORD = '3lmzx5dsorgj'
 proxies = {
     "http": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}",
     "https": f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"

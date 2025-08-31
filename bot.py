@@ -225,9 +225,7 @@ def round_price(symbol, price):
         return price
 
 # === PATTERN DETECTION ===
-def detect_rising
-
-_three(candles):
+def detect_rising_three(candles):
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
     avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
     big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume

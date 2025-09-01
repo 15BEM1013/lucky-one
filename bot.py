@@ -26,7 +26,7 @@ BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
-TP_PCT = 1.0 / 100
+TP_PCT = 0.5 / 100  # Updated from 1.0% to 0.5%
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
@@ -38,7 +38,7 @@ CATEGORY_PRIORITY = {
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 80
 RSI_OVERSOLD = 30
-BODY_SIZE_THRESHOLD = 0.1
+BODY_SIZE_THRESHOLD = 10.0  # Updated from 0.1% to 10%
 SUMMARY_INTERVAL = 3600
 
 # === PROXY CONFIGURATION ===
@@ -382,8 +382,8 @@ def check_tp_sl():
                                 f"ema 9 {'above' if trade['pattern'] == 'rising' else 'below'} 21 - {ema_status['ema9_ema21']}\n"
                                 f"First small candle: {trade['first_candle_analysis']}\n"
                                 f"entry - {trade['entry']}\n"
-                                f"tp - {trade['tp']}: {'✅' if 'TP' in hit else ''}\n"
-                                f"sl - {trade['sl']}: {'❌' if 'SL' in hit else ''}\n"
+                                f"tp - {trade['tp']}\n"
+                                f"sl - {trade['sl']}\n"
                                 f"Profit/Loss: {pnl:.2f}% (${profit:.2f})\n{hit}"
                             )
                             trade['msg'] = new_msg
@@ -424,6 +424,7 @@ def process_symbol(symbol, alert_queue):
 
         signal_time = candles[-2][0]
         first_small_candle_close = round_price(symbol, candles[-3][4])
+        second_small_candle_close = round_price(symbol, candles[-2][4])
         big_candle_close = round_price(symbol, candles[-4][4])
 
         if detect_rising_three(candles):
@@ -457,7 +458,7 @@ def process_symbol(symbol, alert_queue):
                 pattern = 'rising'
             else:
                 side = 'buy'
-                entry_price = first_small_candle_close
+                entry_price = second_small_candle_close
                 tp = big_candle_close
                 sl = round_price(symbol, entry_price * (1 - SL_PCT))
                 pattern = 'rising'
@@ -505,7 +506,7 @@ def process_symbol(symbol, alert_queue):
                 pattern = 'falling'
             else:
                 side = 'sell'
-                entry_price = first_small_candle_close
+                entry_price = second_small_candle_close
                 tp = big_candle_close
                 sl = round_price(symbol, entry_price * (1 + SL_PCT))
                 pattern = 'falling'
@@ -730,7 +731,7 @@ def scan_loop():
                 f"- ⚠️⚠️ Two Cautions:\n"
                 f"  - Body ≤ 10%:\n"
                 f"    - Neutral ✅: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"    - Selling Pressure ⚠️: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"    - Selling Pressure ⚠️: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL Mugh وتعني: **الدخول**  
                 f"    - Buying Pressure ⚠️: {two_cautions_metrics['small_body']['buying'][0]} trades (W: {two_cautions_metrics['small_body']['buying'][1]}, L: {two_cautions_metrics['small_body']['buying'][2]}, TP: {two_cautions_metrics['small_body']['buying'][3]}, SL: {two_cautions_metrics['small_body']['buying'][4]}), PnL: ${two_cautions_metrics['small_body']['buying'][5]:.2f} ({two_cautions_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['buying'][7]:.2f}%\n"
                 f"    - Total: {two_cautions_metrics['small_body']['total'][0]} trades (W: {two_cautions_metrics['small_body']['total'][1]}, L: {two_cautions_metrics['small_body']['total'][2]}, TP: {two_cautions_metrics['small_body']['total'][3]}, SL: {two_cautions_metrics['small_body']['total'][4]}), PnL: ${two_cautions_metrics['small_body']['total'][5]:.2f} ({two_cautions_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Body > 10%:\n"

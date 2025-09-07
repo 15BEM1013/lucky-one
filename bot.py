@@ -1,4 +1,3 @@
-
 import ccxt
 import time
 import threading
@@ -44,16 +43,8 @@ SUMMARY_INTERVAL = 3600
 
 # === PROXY CONFIGURATION ===
 PROXY_LIST = [
-    {'host': '23.95.150.145', 'port': '6114', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '198.23.239.134', 'port': '6540', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '45.38.107.97', 'port': '6014', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '107.172.163.27', 'port': '6543', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '64.137.96.74', 'port': '6641', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '45.43.186.39', 'port': '6257', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '154.203.43.247', 'port': '5536', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '216.10.27.159', 'port': '6837', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '136.0.207.84', 'port': '6661', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
-    {'host': '142.147.128.93', 'port': '6593', 'username': 'octxnfvk', 'password': '3lmzx5dsorgj'},
+    {'host': '45.38.107.97', 'port': '6014', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+  
 ]
 
 def get_proxy_config(proxy):
@@ -647,24 +638,24 @@ def scan_loop():
             two_cautions_trades = [t for t in all_closed_trades if t['category'] == 'two_cautions']
 
             def get_pressure_metrics(trades):
-                small_body_trades = [t for t in trades if t['body_pct'] <= BODY_SIZE_THRESHOLD]
-                large_body_trades = [t for t in trades if t['body_pct'] > BODY_SIZE_THRESHOLD]
+                small_body_trades = [t for t in trades if t.get('body_pct', float('inf')) <= BODY_SIZE_THRESHOLD]
+                large_body_trades = [t for t in trades if t.get('body_pct', float('inf')) > BODY_SIZE_THRESHOLD]
 
-                small_neutral_trades = [t for t in small_body_trades if t['pressure_status'] == 'neutral']
-                small_selling_trades = [t for t in small_body_trades if t['pressure_status'] == 'selling_pressure']
-                small_buying_trades = [t for t in small_body_trades if t['pressure_status'] == 'buying_pressure']
-                large_neutral_trades = [t for t in large_body_trades if t['pressure_status'] == 'neutral']
-                large_selling_trades = [t for t in large_body_trades if t['pressure_status'] == 'selling_pressure']
-                large_buying_trades = [t for t in large_body_trades if t['pressure_status'] == 'buying_pressure']
+                small_neutral_trades = [t for t in small_body_trades if t.get('pressure_status') == 'neutral']
+                small_selling_trades = [t for t in small_body_trades if t.get('pressure_status') == 'selling_pressure']
+                small_buying_trades = [t for t in small_body_trades if t.get('pressure_status') == 'buying_pressure']
+                large_neutral_trades = [t for t in large_body_trades if t.get('pressure_status') == 'neutral']
+                large_selling_trades = [t for t in large_body_trades if t.get('pressure_status') == 'selling_pressure']
+                large_buying_trades = [t for t in large_body_trades if t.get('pressure_status') == 'buying_pressure']
 
                 def calc_metrics(trade_list):
                     count = len(trade_list)
-                    wins = sum(1 for t in trade_list if t['pnl'] > 0)
-                    losses = sum(1 for t in trade_list if t['pnl'] < 0)
-                    tp_hits = sum(1 for t in trade_list if t['hit'] == '✅ TP hit')
-                    sl_hits = sum(1 for t in trade_list if t['hit'] == '❌ SL hit')
-                    pnl = sum(t['pnl'] for t in trade_list)
-                    pnl_pct = sum(t['pnl_pct'] for t in trade_list)
+                    wins = sum(1 for t in trade_list if t.get('pnl', 0) > 0)
+                    losses = sum(1 for t in trade_list if t.get('pnl', 0) < 0)
+                    tp_hits = sum(1 for t in trade_list if t.get('hit') == '✅ TP hit')
+                    sl_hits = sum(1 for t in trade_list if t.get('hit') == '❌ SL hit')
+                    pnl = sum(t.get('pnl', 0) for t in trade_list)
+                    pnl_pct = sum(t.get('pnl_pct', 0) for t in trade_list)
                     win_rate = (wins / count * 100) if count > 0 else 0.00
                     return count, wins, losses, tp_hits, sl_hits, pnl, pnl_pct, win_rate
 
@@ -697,19 +688,19 @@ def scan_loop():
             two_green_metrics = get_pressure_metrics(two_green_trades)
             two_cautions_metrics = get_pressure_metrics(two_cautions_trades)
 
-            total_pnl = sum(t['pnl'] for t in all_closed_trades)
-            total_pnl_pct = sum(t['pnl_pct'] for t in all_closed_trades)
+            total_pnl = sum(t.get('pnl', 0) for t in all_closed_trades)
+            total_pnl_pct = sum(t.get('pnl_pct', 0) for t in all_closed_trades)
             cumulative_pnl = total_pnl
             cumulative_pnl_pct = total_pnl_pct
 
             if all_closed_trades:
                 symbol_pnl = {}
                 for trade in all_closed_trades:
-                    sym = trade['symbol']
-                    symbol_pnl[sym] = symbol_pnl.get(sym, 0) + trade['pnl']
+                    sym = trade.get('symbol', '')
+                    symbol_pnl[sym] = symbol_pnl.get(sym, 0) + trade.get('pnl', 0)
                 top_symbol = max(symbol_pnl.items(), key=lambda x: x[1], default=(None, 0))
                 top_symbol_name, top_symbol_pnl = top_symbol
-                top_symbol_pnl_pct = sum(t['pnl_pct'] for t in all_closed_trades if t['symbol'] == top_symbol_name)
+                top_symbol_pnl_pct = sum(t.get('pnl_pct', 0) for t in all_closed_trades if t.get('symbol') == top_symbol_name)
             else:
                 top_symbol_name, top_symbol_pnl, top_symbol_pnl_pct = None, 0, 0
 

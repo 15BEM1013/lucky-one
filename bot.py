@@ -33,6 +33,7 @@ CLOSED_TRADE_FILE = 'closed_trades.json'
 MAX_OPEN_TRADES = 5
 CATEGORY_PRIORITY = {
     'two_green': 3,
+    'one_green': 2,
     'two_cautions': 1
 }
 RSI_PERIOD = 14
@@ -443,13 +444,7 @@ def process_symbol(symbol, alert_queue):
 
         if detect_rising_three(candles):
             first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
-            if rsi > RSI_OVERBOUGHT:
-                msg = (
-                    f"{symbol} - RISING PATTERN DETECTED BUT SKIPPED\n"
-                    f"RSI: {rsi:.2f} (Overbought, > {RSI_OVERBOUGHT})\n"
-                    f"First small candle: {first_candle_analysis['text']}"
-                )
-                send_telegram(msg)
+            if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'rising')) == signal_time:
                 return
@@ -461,21 +456,17 @@ def process_symbol(symbol, alert_queue):
                 'ema9_ema21': '✅' if ema9_above_ema21 else '⚠️'
             }
             green_count = sum(1 for v in ema_status.values() if v == '✅')
-            if green_count == 1:
-                return
-            category = 'two_green' if green_count == 2 else 'two_cautions'
-            if first_candle_analysis['body_pct'] <= BODY_SIZE_THRESHOLD:
-                side = 'sell'
-                entry_price = first_small_candle_close
-                tp = round_price(symbol, entry_price * (1 - TP_PCT))
-                sl = round_price(symbol, entry_price * (1 + SL_PCT))
-                pattern = 'rising'
+            if green_count == 2:
+                category = 'two_green'
+            elif green_count == 1:
+                category = 'one_green'
             else:
-                side = 'buy'
-                entry_price = second_small_candle_close
-                tp = big_candle_close
-                sl = round_price(symbol, entry_price * (1 - SL_PCT))
-                pattern = 'rising'
+                category = 'two_cautions'
+            side = 'sell'
+            entry_price = first_small_candle_close
+            tp = round_price(symbol, entry_price * (1 - TP_PCT))
+            sl = round_price(symbol, entry_price * (1 + SL_PCT))
+            pattern = 'rising'
             msg = (
                 f"{symbol} - {'REVERSED SELL' if side == 'sell' else 'RISING'} PATTERN\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
@@ -491,13 +482,7 @@ def process_symbol(symbol, alert_queue):
 
         elif detect_falling_three(candles):
             first_candle_analysis = analyze_first_small_candle(candles[-3], 'falling')
-            if rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT:
-                msg = (
-                    f"{symbol} - FALLING PATTERN DETECTED BUT SKIPPED\n"
-                    f"RSI: {rsi:.2f} (Oversold, < {RSI_OVERSOLD} or Overbought, > {RSI_OVERBOUGHT})\n"
-                    f"First small candle: {first_candle_analysis['text']}"
-                )
-                send_telegram(msg)
+            if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'falling')) == signal_time:
                 return
@@ -509,21 +494,17 @@ def process_symbol(symbol, alert_queue):
                 'ema9_ema21': '✅' if ema9_below_ema21 else '⚠️'
             }
             green_count = sum(1 for v in ema_status.values() if v == '✅')
-            if green_count == 1:
-                return
-            category = 'two_green' if green_count == 2 else 'two_cautions'
-            if first_candle_analysis['body_pct'] <= BODY_SIZE_THRESHOLD:
-                side = 'buy'
-                entry_price = first_small_candle_close
-                tp = round_price(symbol, entry_price * (1 + TP_PCT))
-                sl = round_price(symbol, entry_price * (1 - SL_PCT))
-                pattern = 'falling'
+            if green_count == 2:
+                category = 'two_green'
+            elif green_count == 1:
+                category = 'one_green'
             else:
-                side = 'sell'
-                entry_price = second_small_candle_close
-                tp = big_candle_close
-                sl = round_price(symbol, entry_price * (1 + SL_PCT))
-                pattern = 'falling'
+                category = 'two_cautions'
+            side = 'buy'
+            entry_price = first_small_candle_close
+            tp = round_price(symbol, entry_price * (1 + TP_PCT))
+            sl = round_price(symbol, entry_price * (1 - SL_PCT))
+            pattern = 'falling'
             msg = (
                 f"{symbol} - {'REVERSED BUY' if side == 'buy' else 'FALLING'} PATTERN\n"
                 f"Below 21 ema - {ema_status['price_ema21']}\n"
@@ -657,18 +638,15 @@ def scan_loop():
         if current_time - last_summary_time >= SUMMARY_INTERVAL:
             all_closed_trades = load_closed_trades()
             two_green_trades = [t for t in all_closed_trades if t['category'] == 'two_green']
+            one_green_trades = [t for t in all_closed_trades if t['category'] == 'one_green']
             two_cautions_trades = [t for t in all_closed_trades if t['category'] == 'two_cautions']
 
             def get_pressure_metrics(trades):
                 small_body_trades = [t for t in trades if t.get('body_pct', float('inf')) <= BODY_SIZE_THRESHOLD]
-                large_body_trades = [t for t in trades if t.get('body_pct', float('inf')) > BODY_SIZE_THRESHOLD]
 
                 small_neutral_trades = [t for t in small_body_trades if t.get('pressure_status') == 'neutral']
                 small_selling_trades = [t for t in small_body_trades if t.get('pressure_status') == 'selling_pressure']
                 small_buying_trades = [t for t in small_body_trades if t.get('pressure_status') == 'buying_pressure']
-                large_neutral_trades = [t for t in large_body_trades if t.get('pressure_status') == 'neutral']
-                large_selling_trades = [t for t in large_body_trades if t.get('pressure_status') == 'selling_pressure']
-                large_buying_trades = [t for t in large_body_trades if t.get('pressure_status') == 'buying_pressure']
 
                 def calc_metrics(trade_list):
                     count = len(trade_list)
@@ -685,10 +663,6 @@ def scan_loop():
                 small_selling_metrics = calc_metrics(small_selling_trades)
                 small_buying_metrics = calc_metrics(small_buying_trades)
                 small_total_metrics = calc_metrics(small_body_trades)
-                large_neutral_metrics = calc_metrics(large_neutral_trades)
-                large_selling_metrics = calc_metrics(large_selling_trades)
-                large_buying_metrics = calc_metrics(large_buying_trades)
-                large_total_metrics = calc_metrics(large_body_trades)
                 total_metrics = calc_metrics(trades)
 
                 return {
@@ -698,16 +672,11 @@ def scan_loop():
                         'buying': small_buying_metrics,
                         'total': small_total_metrics
                     },
-                    'large_body': {
-                        'neutral': large_neutral_metrics,
-                        'selling': large_selling_metrics,
-                        'buying': large_buying_metrics,
-                        'total': large_total_metrics
-                    },
                     'total': total_metrics
                 }
 
             two_green_metrics = get_pressure_metrics(two_green_trades)
+            one_green_metrics = get_pressure_metrics(one_green_trades)
             two_cautions_metrics = get_pressure_metrics(two_cautions_trades)
 
             total_pnl = sum(t.get('pnl', 0) for t in all_closed_trades)
@@ -731,28 +700,22 @@ def scan_loop():
                 f"🔍 Hourly Summary at {timestamp}\n"
                 f"📊 Trade Summary (Closed Trades):\n"
                 f"- ✅✅ Two Green Ticks:\n"
-                f"  - Body ≤ 0.1%:\n"
-                f"    - Neutral ✅: {two_green_metrics['small_body']['neutral'][0]} trades (W: {two_green_metrics['small_body']['neutral'][1]}, L: {two_green_metrics['small_body']['neutral'][2]}, TP: {two_green_metrics['small_body']['neutral'][3]}, SL: {two_green_metrics['small_body']['neutral'][4]}), PnL: ${two_green_metrics['small_body']['neutral'][5]:.2f} ({two_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"    - Selling Pressure ⚠️: {two_green_metrics['small_body']['selling'][0]} trades (W: {two_green_metrics['small_body']['selling'][1]}, L: {two_green_metrics['small_body']['selling'][2]}, TP: {two_green_metrics['small_body']['selling'][3]}, SL: {two_green_metrics['small_body']['selling'][4]}), PnL: ${two_green_metrics['small_body']['selling'][5]:.2f} ({two_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"    - Buying Pressure ⚠️: {two_green_metrics['small_body']['buying'][0]} trades (W: {two_green_metrics['small_body']['buying'][1]}, L: {two_green_metrics['small_body']['buying'][2]}, TP: {two_green_metrics['small_body']['buying'][3]}, SL: {two_green_metrics['small_body']['buying'][4]}), PnL: ${two_green_metrics['small_body']['buying'][5]:.2f} ({two_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['buying'][7]:.2f}%\n"
-                f"    - Total: {two_green_metrics['small_body']['total'][0]} trades (W: {two_green_metrics['small_body']['total'][1]}, L: {two_green_metrics['small_body']['total'][2]}, TP: {two_green_metrics['small_body']['total'][3]}, SL: {two_green_metrics['small_body']['total'][4]}), PnL: ${two_green_metrics['small_body']['total'][5]:.2f} ({two_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['total'][7]:.2f}%\n"
-                f"  - Body > 0.1%:\n"
-                f"    - Neutral ✅: {two_green_metrics['large_body']['neutral'][0]} trades (W: {two_green_metrics['large_body']['neutral'][1]}, L: {two_green_metrics['large_body']['neutral'][2]}, TP: {two_green_metrics['large_body']['neutral'][3]}, SL: {two_green_metrics['large_body']['neutral'][4]}), PnL: ${two_green_metrics['large_body']['neutral'][5]:.2f} ({two_green_metrics['large_body']['neutral'][6]:.2f}%), Win Rate: {two_green_metrics['large_body']['neutral'][7]:.2f}%\n"
-                f"    - Selling Pressure ⚠️: {two_green_metrics['large_body']['selling'][0]} trades (W: {two_green_metrics['large_body']['selling'][1]}, L: {two_green_metrics['large_body']['selling'][2]}, TP: {two_green_metrics['large_body']['selling'][3]}, SL: {two_green_metrics['large_body']['selling'][4]}), PnL: ${two_green_metrics['large_body']['selling'][5]:.2f} ({two_green_metrics['large_body']['selling'][6]:.2f}%), Win Rate: {two_green_metrics['large_body']['selling'][7]:.2f}%\n"
-                f"    - Buying Pressure ⚠️: {two_green_metrics['large_body']['buying'][0]} trades (W: {two_green_metrics['large_body']['buying'][1]}, L: {two_green_metrics['large_body']['buying'][2]}, TP: {two_green_metrics['large_body']['buying'][3]}, SL: {two_green_metrics['large_body']['buying'][4]}), PnL: ${two_green_metrics['large_body']['buying'][5]:.2f} ({two_green_metrics['large_body']['buying'][6]:.2f}%), Win Rate: {two_green_metrics['large_body']['buying'][7]:.2f}%\n"
-                f"    - Total: {two_green_metrics['large_body']['total'][0]} trades (W: {two_green_metrics['large_body']['total'][1]}, L: {two_green_metrics['large_body']['total'][2]}, TP: {two_green_metrics['large_body']['total'][3]}, SL: {two_green_metrics['large_body']['total'][4]}), PnL: ${two_green_metrics['large_body']['total'][5]:.2f} ({two_green_metrics['large_body']['total'][6]:.2f}%), Win Rate: {two_green_metrics['large_body']['total'][7]:.2f}%\n"
+                f"  - Neutral ✅: {two_green_metrics['small_body']['neutral'][0]} trades (W: {two_green_metrics['small_body']['neutral'][1]}, L: {two_green_metrics['small_body']['neutral'][2]}, TP: {two_green_metrics['small_body']['neutral'][3]}, SL: {two_green_metrics['small_body']['neutral'][4]}), PnL: ${two_green_metrics['small_body']['neutral'][5]:.2f} ({two_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ⚠️: {two_green_metrics['small_body']['selling'][0]} trades (W: {two_green_metrics['small_body']['selling'][1]}, L: {two_green_metrics['small_body']['selling'][2]}, TP: {two_green_metrics['small_body']['selling'][3]}, SL: {two_green_metrics['small_body']['selling'][4]}), PnL: ${two_green_metrics['small_body']['selling'][5]:.2f} ({two_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ⚠️: {two_green_metrics['small_body']['buying'][0]} trades (W: {two_green_metrics['small_body']['buying'][1]}, L: {two_green_metrics['small_body']['buying'][2]}, TP: {two_green_metrics['small_body']['buying'][3]}, SL: {two_green_metrics['small_body']['buying'][4]}), PnL: ${two_green_metrics['small_body']['buying'][5]:.2f} ({two_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"  - Total: {two_green_metrics['small_body']['total'][0]} trades (W: {two_green_metrics['small_body']['total'][1]}, L: {two_green_metrics['small_body']['total'][2]}, TP: {two_green_metrics['small_body']['total'][3]}, SL: {two_green_metrics['small_body']['total'][4]}), PnL: ${two_green_metrics['small_body']['total'][5]:.2f} ({two_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {two_green_metrics['total'][0]} trades (W: {two_green_metrics['total'][1]}, L: {two_green_metrics['total'][2]}, TP: {two_green_metrics['total'][3]}, SL: {two_green_metrics['total'][4]}), PnL: ${two_green_metrics['total'][5]:.2f} ({two_green_metrics['total'][6]:.2f}%), Win Rate: {two_green_metrics['total'][7]:.2f}%\n"
+                f"- ✅⚠️ One Green One Caution:\n"
+                f"  - Neutral ✅: {one_green_metrics['small_body']['neutral'][0]} trades (W: {one_green_metrics['small_body']['neutral'][1]}, L: {one_green_metrics['small_body']['neutral'][2]}, TP: {one_green_metrics['small_body']['neutral'][3]}, SL: {one_green_metrics['small_body']['neutral'][4]}), PnL: ${one_green_metrics['small_body']['neutral'][5]:.2f} ({one_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ⚠️: {one_green_metrics['small_body']['selling'][0]} trades (W: {one_green_metrics['small_body']['selling'][1]}, L: {one_green_metrics['small_body']['selling'][2]}, TP: {one_green_metrics['small_body']['selling'][3]}, SL: {one_green_metrics['small_body']['selling'][4]}), PnL: ${one_green_metrics['small_body']['selling'][5]:.2f} ({one_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ⚠️: {one_green_metrics['small_body']['buying'][0]} trades (W: {one_green_metrics['small_body']['buying'][1]}, L: {one_green_metrics['small_body']['buying'][2]}, TP: {one_green_metrics['small_body']['buying'][3]}, SL: {one_green_metrics['small_body']['buying'][4]}), PnL: ${one_green_metrics['small_body']['buying'][5]:.2f} ({one_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"  - Total: {one_green_metrics['small_body']['total'][0]} trades (W: {one_green_metrics['small_body']['total'][1]}, L: {one_green_metrics['small_body']['total'][2]}, TP: {one_green_metrics['small_body']['total'][3]}, SL: {one_green_metrics['small_body']['total'][4]}), PnL: ${one_green_metrics['small_body']['total'][5]:.2f} ({one_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['total'][7]:.2f}%\n"
+                f"  - Overall Total: {one_green_metrics['total'][0]} trades (W: {one_green_metrics['total'][1]}, L: {one_green_metrics['total'][2]}, TP: {one_green_metrics['total'][3]}, SL: {one_green_metrics['total'][4]}), PnL: ${one_green_metrics['total'][5]:.2f} ({one_green_metrics['total'][6]:.2f}%), Win Rate: {one_green_metrics['total'][7]:.2f}%\n"
                 f"- ⚠️⚠️ Two Cautions:\n"
-                f"  - Body ≤ 0.1%:\n"
-                f"    - Neutral ✅: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"    - Selling Pressure ⚠️: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"    - Buying Pressure ⚠️: {two_cautions_metrics['small_body']['buying'][0]} trades (W: {two_cautions_metrics['small_body']['buying'][1]}, L: {two_cautions_metrics['small_body']['buying'][2]}, TP: {two_cautions_metrics['small_body']['buying'][3]}, SL: {two_cautions_metrics['small_body']['buying'][4]}), PnL: ${two_cautions_metrics['small_body']['buying'][5]:.2f} ({two_cautions_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['buying'][7]:.2f}%\n"
-                f"    - Total: {two_cautions_metrics['small_body']['total'][0]} trades (W: {two_cautions_metrics['small_body']['total'][1]}, L: {two_cautions_metrics['small_body']['total'][2]}, TP: {two_cautions_metrics['small_body']['total'][3]}, SL: {two_cautions_metrics['small_body']['total'][4]}), PnL: ${two_cautions_metrics['small_body']['total'][5]:.2f} ({two_cautions_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['total'][7]:.2f}%\n"
-                f"  - Body > 0.1%:\n"
-                f"    - Neutral ✅: {two_cautions_metrics['large_body']['neutral'][0]} trades (W: {two_cautions_metrics['large_body']['neutral'][1]}, L: {two_cautions_metrics['large_body']['neutral'][2]}, TP: {two_cautions_metrics['large_body']['neutral'][3]}, SL: {two_cautions_metrics['large_body']['neutral'][4]}), PnL: ${two_cautions_metrics['large_body']['neutral'][5]:.2f} ({two_cautions_metrics['large_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['large_body']['neutral'][7]:.2f}%\n"
-                f"    - Selling Pressure ⚠️: {two_cautions_metrics['large_body']['selling'][0]} trades (W: {two_cautions_metrics['large_body']['selling'][1]}, L: {two_cautions_metrics['large_body']['selling'][2]}, TP: {two_cautions_metrics['large_body']['selling'][3]}, SL: {two_cautions_metrics['large_body']['selling'][4]}), PnL: ${two_cautions_metrics['large_body']['selling'][5]:.2f} ({two_cautions_metrics['large_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['large_body']['selling'][7]:.2f}%\n"
-                f"    - Buying Pressure ⚠️: {two_cautions_metrics['large_body']['buying'][0]} trades (W: {two_cautions_metrics['large_body']['buying'][1]}, L: {two_cautions_metrics['large_body']['buying'][2]}, TP: {two_cautions_metrics['large_body']['buying'][3]}, SL: {two_cautions_metrics['large_body']['buying'][4]}), PnL: ${two_cautions_metrics['large_body']['buying'][5]:.2f} ({two_cautions_metrics['large_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['large_body']['buying'][7]:.2f}%\n"
-                f"    - Total: {two_cautions_metrics['large_body']['total'][0]} trades (W: {two_cautions_metrics['large_body']['total'][1]}, L: {two_cautions_metrics['large_body']['total'][2]}, TP: {two_cautions_metrics['large_body']['total'][3]}, SL: {two_cautions_metrics['large_body']['total'][4]}), PnL: ${two_cautions_metrics['large_body']['total'][5]:.2f} ({two_cautions_metrics['large_body']['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['large_body']['total'][7]:.2f}%\n"
+                f"  - Neutral ✅: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ⚠️: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ⚠️: {two_cautions_metrics['small_body']['buying'][0]} trades (W: {two_cautions_metrics['small_body']['buying'][1]}, L: {two_cautions_metrics['small_body']['buying'][2]}, TP: {two_cautions_metrics['small_body']['buying'][3]}, SL: {two_cautions_metrics['small_body']['buying'][4]}), PnL: ${two_cautions_metrics['small_body']['buying'][5]:.2f} ({two_cautions_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"  - Total: {two_cautions_metrics['small_body']['total'][0]} trades (W: {two_cautions_metrics['small_body']['total'][1]}, L: {two_cautions_metrics['small_body']['total'][2]}, TP: {two_cautions_metrics['small_body']['total'][3]}, SL: {two_cautions_metrics['small_body']['total'][4]}), PnL: ${two_cautions_metrics['small_body']['total'][5]:.2f} ({two_cautions_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {two_cautions_metrics['total'][0]} trades (W: {two_cautions_metrics['total'][1]}, L: {two_cautions_metrics['total'][2]}, TP: {two_cautions_metrics['total'][3]}, SL: {two_cautions_metrics['total'][4]}), PnL: ${two_cautions_metrics['total'][5]:.2f} ({two_cautions_metrics['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['total'][7]:.2f}%\n"
                 f"💰 Total Executed PnL: ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
                 f"📈 Cumulative Executed PnL: ${cumulative_pnl:.2f} ({cumulative_pnl_pct:.2f}%)\n"

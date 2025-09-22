@@ -1,3 +1,4 @@
+
 import ccxt
 import time
 import threading
@@ -13,10 +14,20 @@ import os
 import talib
 import numpy as np
 import logging
+from dotenv import load_dotenv
+import redis
+
+# Load environment variables
+load_dotenv()
+API_KEY = os.getenv('API_KEY')
+API_SECRET = os.getenv('API_SECRET')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
+
+# Initialize Redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
 # === CONFIG ===
-BOT_TOKEN = '7402265241:AAHRDxd12LRizl1qTsQggEEoJ-BeWME3ERo'
-CHAT_ID = '655537138'
 TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 1.0
@@ -24,12 +35,11 @@ MIN_LOWER_WICK_PCT = 20.0
 MAX_WORKERS = 5
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
-CAPITAL = 10.0
+CAPITAL = 10.0  # $10 per trade
+LEVERAGE = 5  # 5x leverage
 SL_PCT = 1.5 / 100
-TP_PCT = 0.5 / 100
+TP_PCT = 0.7 / 100  # Take-profit set to 0.7%
 TP_SL_CHECK_INTERVAL = 30
-TRADE_FILE = 'open_trades.json'
-CLOSED_TRADE_FILE = 'closed_trades.json'
 MAX_OPEN_TRADES = 5
 CATEGORY_PRIORITY = {
     'two_green': 3,
@@ -76,45 +86,41 @@ def get_ist_time():
 # === TRADE PERSISTENCE ===
 def save_trades():
     try:
-        with open(TRADE_FILE, 'w') as f:
-            json.dump(open_trades, f, default=str)
-        print(f"Trades saved to {TRADE_FILE}")
+        redis_client.set('open_trades', json.dumps(open_trades, default=str))
+        logging.info("Trades saved to Redis")
     except Exception as e:
-        print(f"Error saving trades: {e}")
+        logging.error(f"Error saving trades to Redis: {e}")
 
 def load_trades():
     global open_trades
     try:
-        if os.path.exists(TRADE_FILE):
-            with open(TRADE_FILE, 'r') as f:
-                loaded = json.load(f)
-                open_trades = {k: v for k, v in loaded.items()}
-            print(f"Loaded {len(open_trades)} trades from {TRADE_FILE}")
+        data = redis_client.get('open_trades')
+        if data:
+            open_trades = json.loads(data)
+            logging.info(f"Loaded {len(open_trades)} trades from Redis")
+        else:
+            open_trades = {}
     except Exception as e:
-        print(f"Error loading trades: {e}")
+        logging.error(f"Error loading trades from Redis: {e}")
         open_trades = {}
 
 def save_closed_trades(closed_trade):
     try:
-        all_closed_trades = []
-        if os.path.exists(CLOSED_TRADE_FILE):
-            with open(CLOSED_TRADE_FILE, 'r') as f:
-                all_closed_trades = json.load(f)
+        all_closed_trades = load_closed_trades()
         all_closed_trades.append(closed_trade)
-        with open(CLOSED_TRADE_FILE, 'w') as f:
-            json.dump(all_closed_trades, f, default=str)
-        print(f"Closed trade saved to {CLOSED_TRADE_FILE}")
+        redis_client.set('closed_trades', json.dumps(all_closed_trades, default=str))
+        logging.info("Closed trade saved to Redis")
     except Exception as e:
-        print(f"Error saving closed trades: {e}")
+        logging.error(f"Error saving closed trades to Redis: {e}")
 
 def load_closed_trades():
     try:
-        if os.path.exists(CLOSED_TRADE_FILE):
-            with open(CLOSED_TRADE_FILE, 'r') as f:
-                return json.load(f)
+        data = redis_client.get('closed_trades')
+        if data:
+            return json.loads(data)
         return []
     except Exception as e:
-        print(f"Error loading closed trades: {e}")
+        logging.error(f"Error loading closed trades from Redis: {e}")
         return []
 
 # === TELEGRAM ===
@@ -123,10 +129,10 @@ def send_telegram(msg):
     data = {'chat_id': CHAT_ID, 'text': msg}
     try:
         response = requests.post(url, data=data, timeout=5, proxies=proxies).json()
-        print(f"Telegram sent: {msg}")
+        logging.info(f"Telegram sent: {msg}")
         return response.get('result', {}).get('message_id')
     except Exception as e:
-        print(f"Telegram error: {e}")
+        logging.error(f"Telegram error: {e}")
         return None
 
 def edit_telegram_message(message_id, new_text):
@@ -134,15 +140,15 @@ def edit_telegram_message(message_id, new_text):
     data = {'chat_id': CHAT_ID, 'message_id': message_id, 'text': new_text}
     try:
         requests.post(url, data=data, timeout=5, proxies=proxies)
-        print(f"Telegram updated: {new_text}")
+        logging.info(f"Telegram updated: {new_text}")
     except Exception as e:
-        print(f"Edit error: {e}")
+        logging.error(f"Edit error: {e}")
 
 # === INIT ===
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-def initialize_exchange():
+def initialize_exchange(testnet=False):
     for proxy in PROXY_LIST:
         try:
             proxies = get_proxy_config(proxy)
@@ -151,10 +157,13 @@ def initialize_exchange():
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
             exchange = ccxt.binance({
+                'apiKey': API_KEY,
+                'secret': API_SECRET,
+                'enableRateLimit': True,
                 'options': {'defaultType': 'future'},
                 'proxies': proxies,
-                'enableRateLimit': True,
-                'session': session
+                'session': session,
+                'urls': {'api': {'public': 'https://testnet.binancefuture.com', 'private': 'https://testnet.binancefuture.com'}} if testnet else {}
             })
             exchange.load_markets()
             logging.info(f"Successfully connected using proxy: {proxy['host']}:{proxy['port']}")
@@ -165,8 +174,11 @@ def initialize_exchange():
     logging.error("All proxies failed. Falling back to direct connection.")
     try:
         exchange = ccxt.binance({
+            'apiKey': API_KEY,
+            'secret': API_SECRET,
+            'enableRateLimit': True,
             'options': {'defaultType': 'future'},
-            'enableRateLimit': True
+            'urls': {'api': {'public': 'https://testnet.binancefuture.com', 'private': 'https://testnet.binancefuture.com'}} if testnet else {}
         })
         exchange.load_markets()
         logging.info("Successfully connected using direct connection.")
@@ -183,7 +195,7 @@ closed_trades = []
 last_summary_time = 0
 
 try:
-    exchange, proxies = initialize_exchange()
+    exchange, proxies = initialize_exchange(testnet=False)  # Live trading
 except Exception as e:
     logging.error(f"Failed to initialize exchange: {e}")
     exit(1)
@@ -266,41 +278,84 @@ def round_price(symbol, price):
         precision = int(round(-math.log10(tick_size)))
         return round(price, precision)
     except Exception as e:
-        print(f"Error rounding price for {symbol}: {e}")
+        logging.error(f"Error rounding price for {symbol}: {e}")
         return price
+
+# === ORDER PLACEMENT ===
+def set_leverage(symbol, leverage):
+    try:
+        exchange.fapiPrivate_post_leverage({
+            'symbol': exchange.market(symbol)['id'],
+            'leverage': leverage
+        })
+        logging.info(f"Set leverage {leverage}x for {symbol}")
+    except Exception as e:
+        logging.error(f"Error setting leverage for {symbol}: {e}")
+
+def place_order(symbol, side, entry_price, tp, sl):
+    try:
+        # Calculate quantity based on capital and leverage
+        market = exchange.market(symbol)
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        quantity = (CAPITAL * LEVERAGE) / current_price
+        quantity = exchange.amount_to_precision(symbol, quantity)
+
+        # Set leverage
+        set_leverage(symbol, LEVERAGE)
+
+        # Place market order
+        order = exchange.create_market_order(symbol, side, quantity)
+        logging.info(f"Placed {side} market order for {symbol}: {quantity} @ {current_price}")
+
+        # Set TP/SL orders
+        if side == 'buy':
+            tp_order = exchange.create_order(
+                symbol, 'limit', 'sell', quantity, tp,
+                {'type': 'TAKE_PROFIT', 'stopPrice': tp}
+            )
+            sl_order = exchange.create_order(
+                symbol, 'stop_market', 'sell', quantity, None,
+                {'type': 'STOP_MARKET', 'stopPrice': sl}
+            )
+        else:
+            tp_order = exchange.create_order(
+                symbol, 'limit', 'buy', quantity, tp,
+                {'type': 'TAKE_PROFIT', 'stopPrice': tp}
+            )
+            sl_order = exchange.create_order(
+                symbol, 'stop_market', 'buy', quantity, None,
+                {'type': 'STOP_MARKET', 'stopPrice': sl}
+            )
+        logging.info(f"Set TP {tp} and SL {sl} for {symbol}")
+        return order['id'], tp_order['id'], sl_order['id']
+    except Exception as e:
+        logging.error(f"Error placing order for {symbol}: {e}")
+        return None, None, None
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
-    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    # Check for big green candle followed by one small red candle
+    c2, c1 = candles[-3], candles[-2]  # Adjusted to check one candle earlier
+    avg_volume = sum(c[5] for c in candles[-5:-1]) / 4
     big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     small_red_1 = (
         is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
         c1[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    small_red_0 = (
-        is_bearish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
-        lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT and
-        c0[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
-    )
-    volume_decreasing = c1[5] > c0[5]
-    return big_green and small_red_1 and small_red_0 and volume_decreasing
+    return big_green and small_red_1
 
 def detect_falling_three(candles):
-    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
-    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    # Check for big red candle followed by one small green candle
+    c2, c1 = candles[-3], candles[-2]  # Adjusted to check one candle earlier
+    avg_volume = sum(c[5] for c in candles[-5:-1]) / 4
     big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     small_green_1 = (
         is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    small_green_0 = (
-        is_bullish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
-        c0[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
-    )
-    volume_decreasing = c1[5] > c0[5]
-    return big_red and small_green_1 and small_green_0 and volume_decreasing
+    return big_red and small_green_1
 
 # === SYMBOLS ===
 def get_symbols():
@@ -328,48 +383,17 @@ def check_tp_sl():
                         pnl = 0
                         hit_price = None
 
-                        entry_time = trade.get('entry_time')
-                        if entry_time:
-                            candles_1m = exchange.fetch_ohlcv(sym, '1m', since=entry_time, limit=2880)
-                            for c in candles_1m:
-                                high = c[2]
-                                low = c[3]
-                                if trade['side'] == 'buy':
-                                    if high >= trade['tp']:
-                                        hit = "✅ TP hit"
-                                        hit_price = trade['tp']
-                                        break
-                                    if low <= trade['sl']:
-                                        hit = "❌ SL hit"
-                                        hit_price = trade['sl']
-                                        break
-                                else:
-                                    if low <= trade['tp']:
-                                        hit = "✅ TP hit"
-                                        hit_price = trade['tp']
-                                        break
-                                    if high >= trade['sl']:
-                                        hit = "❌ SL hit"
-                                        hit_price = trade['sl']
-                                        break
-
-                        if not hit:
-                            ticker = exchange.fetch_ticker(sym)
-                            last = round_price(sym, ticker['last'])
-                            if trade['side'] == 'buy':
-                                if last >= trade['tp']:
-                                    hit = "✅ TP hit"
-                                    hit_price = trade['tp']
-                                elif last <= trade['sl']:
-                                    hit = "❌ SL hit"
-                                    hit_price = trade['sl']
-                            else:
-                                if last <= trade['tp']:
-                                    hit = "✅ TP hit"
-                                    hit_price = trade['tp']
-                                elif last >= trade['sl']:
-                                    hit = "❌ SL hit"
-                                    hit_price = trade['sl']
+                        # Check if TP or SL order was filled
+                        if trade.get('tp_order_id'):
+                            tp_order = exchange.fetch_order(trade['tp_order_id'], sym)
+                            if tp_order['status'] == 'closed':
+                                hit = "✅ TP hit"
+                                hit_price = trade['tp']
+                        if not hit and trade.get('sl_order_id'):
+                            sl_order = exchange.fetch_order(trade['sl_order_id'], sym)
+                            if sl_order['status'] == 'closed':
+                                hit = "❌ SL hit"
+                                hit_price = trade['sl']
 
                         if hit:
                             if trade['side'] == 'buy':
@@ -405,6 +429,16 @@ def check_tp_sl():
                             trade['hit'] = hit
                             logging.info(f"Updating Telegram message for {sym}: {hit}")
                             edit_telegram_message(trade['msg_id'], new_msg)
+                            # Cancel any remaining orders
+                            try:
+                                if trade.get('order_id'):
+                                    exchange.cancel_order(trade['order_id'], sym)
+                                if trade.get('tp_order_id') and not hit.startswith("✅"):
+                                    exchange.cancel_order(trade['tp_order_id'], sym)
+                                if trade.get('sl_order_id') and not hit.startswith("❌"):
+                                    exchange.cancel_order(trade['sl_order_id'], sym)
+                            except Exception as e:
+                                logging.error(f"Error canceling orders for {sym}: {e}")
                             del open_trades[sym]
                             save_trades()
                             logging.info(f"Trade closed for {sym}")
@@ -427,7 +461,7 @@ def process_symbol(symbol, alert_queue):
                     break
                 time.sleep(0.5)
             except ccxt.NetworkError as e:
-                print(f"Network error on {symbol}: {e}")
+                logging.error(f"Network error on {symbol}: {e}")
                 time.sleep(2 ** attempt)
                 continue
 
@@ -437,10 +471,8 @@ def process_symbol(symbol, alert_queue):
         if ema21 is None or ema9 is None or rsi is None:
             return
 
-        signal_time = candles[-2][0]
-        first_small_candle_close = round_price(symbol, candles[-3][4])
-        second_small_candle_close = round_price(symbol, candles[-2][4])
-        big_candle_close = round_price(symbol, candles[-4][4])
+        signal_time = candles[-3][0]  # Use first small candle for signal time
+        first_small_candle_close = round_price(symbol, candles[-3][4])  # Entry at first small candle close
 
         if detect_rising_three(candles):
             first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
@@ -535,7 +567,7 @@ def scan_loop():
     global closed_trades, last_summary_time
     load_trades()
     symbols = get_symbols()
-    print(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
+    logging.info(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
     alert_queue = queue.Queue()
 
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
@@ -549,24 +581,29 @@ def scan_loop():
                     if len(open_trades) < MAX_OPEN_TRADES:
                         mid = send_telegram(msg)
                         if mid and symbol not in open_trades:
-                            trade = {
-                                'side': side,
-                                'entry': entry_price,
-                                'tp': tp,
-                                'sl': sl,
-                                'msg': msg,
-                                'msg_id': mid,
-                                'ema_status': ema_status,
-                                'category': category,
-                                'first_candle_analysis': first_candle_analysis,
-                                'pressure_status': pressure_status,
-                                'body_pct': body_pct,
-                                'entry_time': int(time.time() * 1000),
-                                'pattern': pattern
-                            }
-                            open_trades[symbol] = trade
-                            save_trades()
-                            logging.info(f"New trade opened for {symbol}")
+                            order_id, tp_order_id, sl_order_id = place_order(symbol, side, entry_price, tp, sl)
+                            if order_id:
+                                trade = {
+                                    'side': side,
+                                    'entry': entry_price,
+                                    'tp': tp,
+                                    'sl': sl,
+                                    'msg': msg,
+                                    'msg_id': mid,
+                                    'ema_status': ema_status,
+                                    'category': category,
+                                    'first_candle_analysis': first_candle_analysis,
+                                    'pressure_status': pressure_status,
+                                    'body_pct': body_pct,
+                                    'entry_time': int(time.time() * 1000),
+                                    'pattern': pattern,
+                                    'order_id': order_id,
+                                    'tp_order_id': tp_order_id,
+                                    'sl_order_id': sl_order_id
+                                }
+                                open_trades[symbol] = trade
+                                save_trades()
+                                logging.info(f"New trade opened for {symbol}")
                     else:
                         lowest_priority = min(
                             (CATEGORY_PRIORITY[trade['category']] for trade in open_trades.values()),
@@ -575,6 +612,15 @@ def scan_loop():
                         if CATEGORY_PRIORITY[category] > lowest_priority:
                             for sym, trade in list(open_trades.items()):
                                 if CATEGORY_PRIORITY[trade['category']] == lowest_priority:
+                                    try:
+                                        if trade.get('order_id'):
+                                            exchange.cancel_order(trade['order_id'], sym)
+                                        if trade.get('tp_order_id'):
+                                            exchange.cancel_order(trade['tp_order_id'], sym)
+                                        if trade.get('sl_order_id'):
+                                            exchange.cancel_order(trade['sl_order_id'], sym)
+                                    except Exception as e:
+                                        logging.error(f"Error canceling orders for {sym}: {e}")
                                     edit_telegram_message(
                                         trade['msg_id'],
                                         f"{sym} - Trade canceled for higher-priority signal."
@@ -583,24 +629,29 @@ def scan_loop():
                                     save_trades()
                                     mid = send_telegram(msg)
                                     if mid and symbol not in open_trades:
-                                        trade = {
-                                            'side': side,
-                                            'entry': entry_price,
-                                            'tp': tp,
-                                            'sl': sl,
-                                            'msg': msg,
-                                            'msg_id': mid,
-                                            'ema_status': ema_status,
-                                            'category': category,
-                                            'first_candle_analysis': first_candle_analysis,
-                                            'pressure_status': pressure_status,
-                                            'body_pct': body_pct,
-                                            'entry_time': int(time.time() * 1000),
-                                            'pattern': pattern
-                                        }
-                                        open_trades[symbol] = trade
-                                        save_trades()
-                                        logging.info(f"Replaced trade with higher priority for {symbol}")
+                                        order_id, tp_order_id, sl_order_id = place_order(symbol, side, entry_price, tp, sl)
+                                        if order_id:
+                                            trade = {
+                                                'side': side,
+                                                'entry': entry_price,
+                                                'tp': tp,
+                                                'sl': sl,
+                                                'msg': msg,
+                                                'msg_id': mid,
+                                                'ema_status': ema_status,
+                                                'category': category,
+                                                'first_candle_analysis': first_candle_analysis,
+                                                'pressure_status': pressure_status,
+                                                'body_pct': body_pct,
+                                                'entry_time': int(time.time() * 1000),
+                                                'pattern': pattern,
+                                                'order_id': order_id,
+                                                'tp_order_id': tp_order_id,
+                                                'sl_order_id': sl_order_id
+                                            }
+                                            open_trades[symbol] = trade
+                                            save_trades()
+                                            logging.info(f"Replaced trade with higher priority for {symbol}")
                                     break
                     alert_queue.task_done()
             except queue.Empty:
@@ -621,18 +672,18 @@ def scan_loop():
     while True:
         next_close = get_next_candle_close()
         wait_time = max(0, next_close - time.time())
-        print(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
+        logging.info(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
         time.sleep(wait_time)
 
         for i, chunk in enumerate(symbol_chunks):
-            print(f"Processing batch {i+1}/{NUM_CHUNKS}...")
+            logging.info(f"Processing batch {i+1}/{NUM_CHUNKS}...")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
 
-        print("✅ Scan complete.")
+        logging.info("✅ Scan complete.")
         num_open = len(open_trades)
-        print(f"📊 Number of open trades: {num_open}")
+        logging.info(f"📊 Number of open trades: {num_open}")
 
         current_time = time.time()
         if current_time - last_summary_time >= SUMMARY_INTERVAL:

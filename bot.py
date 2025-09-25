@@ -26,7 +26,7 @@ BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
-TP_PCT = 0.7 / 100  # Updated from 0.5% to 0.7%
+TP_PCT = 0.7 / 100
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
@@ -271,36 +271,25 @@ def round_price(symbol, price):
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    c3, c2, c1 = candles[-5], candles[-4], candles[-3]  # Adjusted to check up to first small candle
-    avg_volume = sum(c[5] for c in candles[-7:-2]) / 5
-    big_green = is_bullish(c3) and body_pct(c3) >= MIN_BIG_BODY_PCT and c3[5] > avg_volume
-    small_red_1 = (
-        is_bearish(c2) and body_pct(c2) <= MAX_SMALL_BODY_PCT and
-        lower_wick_pct(c2) >= MIN_LOWER_WICK_PCT and
-        c2[4] > c3[3] + (c3[2] - c3[3]) * 0.3 and c2[5] < c3[5]
-    )
-    small_red_0 = (
+    c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_red = (
         is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
-        c1[4] > c3[3] + (c3[2] - c3[3]) * 0.3 and c1[5] < c3[5]
+        c1[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    volume_decreasing = c2[5] > c1[5]
-    return big_green and small_red_1 and small_red_0 and volume_decreasing
+    return big_green and small_red
 
 def detect_falling_three(candles):
-    c3, c2, c1 = candles[-5], candles[-4], candles[-3]  # Adjusted to check up to first small candle
-    avg_volume = sum(c[5] for c in candles[-7:-2]) / 5
-    big_red = is_bearish(c3) and body_pct(c3) >= MIN_BIG_BODY_PCT and c3[5] > avg_volume
-    small_green_1 = (
-        is_bullish(c2) and body_pct(c2) <= MAX_SMALL_BODY_PCT and
-        c2[4] < c3[2] - (c3[2] - c3[3]) * 0.3 and c2[5] < c3[5]
-    )
-    small_green_0 = (
+    c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_green = (
         is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
-        c1[4] < c3[2] - (c3[2] - c3[3]) * 0.3 and c1[5] < c3[5]
+        c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    volume_decreasing = c2[5] > c1[5]
-    return big_red and small_green_1 and small_green_0 and volume_decreasing
+    return big_red and small_green
 
 # === SYMBOLS ===
 def get_symbols():
@@ -437,12 +426,12 @@ def process_symbol(symbol, alert_queue):
         if ema21 is None or ema9 is None or rsi is None:
             return
 
-        signal_time = candles[-3][0]  # Use first small candle's timestamp
-        first_small_candle_close = round_price(symbol, candles[-3][4])
-        big_candle_close = round_price(symbol, candles[-4][4])
+        signal_time = candles[-2][0]  # Use the last completed candle's timestamp (e.g., 14:00-14:15 when processing at 14:15)
+        first_small_candle_close = round_price(symbol, candles[-2][4])
+        big_candle_close = round_price(symbol, candles[-3][4])
 
         if detect_rising_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
+            first_candle_analysis = analyze_first_small_candle(candles[-2], 'rising')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'rising')) == signal_time:
@@ -480,7 +469,7 @@ def process_symbol(symbol, alert_queue):
             alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
 
         elif detect_falling_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-3], 'falling')
+            first_candle_analysis = analyze_first_small_candle(candles[-2], 'falling')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'falling')) == signal_time:

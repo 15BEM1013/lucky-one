@@ -10,6 +10,8 @@ import math
 import queue
 import json
 import os
+import talib
+import numpy as np
 import logging
 
 # === CONFIG ===
@@ -34,8 +36,31 @@ CATEGORY_PRIORITY = {
     'one_green': 2,
     'two_cautions': 1
 }
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 80
+RSI_OVERSOLD = 30
 BODY_SIZE_THRESHOLD = 0.1
 SUMMARY_INTERVAL = 3600
+
+# === PROXY CONFIGURATION ===
+PROXY_LIST = [
+    {'host': '23.95.150.145', 'port': '6114', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '198.23.239.134', 'port': '6540', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '45.38.107.97', 'port': '6014', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '107.172.163.27', 'port': '6543', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '64.137.96.74', 'port': '6641', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '45.43.186.39', 'port': '6257', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '154.203.43.247', 'port': '5536', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '216.10.27.159', 'port': '6837', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '136.0.207.84', 'port': '6661', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+    {'host': '142.147.128.93', 'port': '6593', 'username': 'ihpzjkrb', 'password': '4s5y5kaq34cs'},
+]
+
+def get_proxy_config(proxy):
+    return {
+        "http": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}",
+        "https": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+    }
 
 # === CONFIGURE LOGGING ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -97,7 +122,7 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {'chat_id': CHAT_ID, 'text': msg}
     try:
-        response = requests.post(url, data=data, timeout=5).json()
+        response = requests.post(url, data=data, timeout=5, proxies=proxies).json()
         print(f"Telegram sent: {msg}")
         return response.get('result', {}).get('message_id')
     except Exception as e:
@@ -108,7 +133,7 @@ def edit_telegram_message(message_id, new_text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     data = {'chat_id': CHAT_ID, 'message_id': message_id, 'text': new_text}
     try:
-        requests.post(url, data=data, timeout=5)
+        requests.post(url, data=data, timeout=5, proxies=proxies)
         print(f"Telegram updated: {new_text}")
     except Exception as e:
         print(f"Edit error: {e}")
@@ -118,21 +143,37 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 def initialize_exchange():
+    for proxy in PROXY_LIST:
+        try:
+            proxies = get_proxy_config(proxy)
+            logging.info(f"Trying proxy: {proxy['host']}:{proxy['port']}")
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+            exchange = ccxt.binance({
+                'options': {'defaultType': 'future'},
+                'proxies': proxies,
+                'enableRateLimit': True,
+                'session': session
+            })
+            exchange.load_markets()
+            logging.info(f"Successfully connected using proxy: {proxy['host']}:{proxy['port']}")
+            return exchange, proxies
+        except Exception as e:
+            logging.error(f"Failed to connect with proxy {proxy['host']}:{proxy['port']}: {e}")
+            continue
+    logging.error("All proxies failed. Falling back to direct connection.")
     try:
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
         exchange = ccxt.binance({
             'options': {'defaultType': 'future'},
-            'enableRateLimit': True,
-            'session': session
+            'enableRateLimit': True
         })
         exchange.load_markets()
-        logging.info("Successfully connected.")
-        return exchange
+        logging.info("Successfully connected using direct connection.")
+        return exchange, None
     except Exception as e:
-        logging.error(f"Connection failed: {e}")
-        raise Exception("Connection failed.")
+        logging.error(f"Direct connection failed: {e}")
+        raise Exception("All proxies and direct connection failed.")
 
 app = Flask(__name__)
 
@@ -142,7 +183,7 @@ closed_trades = []
 last_summary_time = 0
 
 try:
-    exchange = initialize_exchange()
+    exchange, proxies = initialize_exchange()
 except Exception as e:
     logging.error(f"Failed to initialize exchange: {e}")
     exit(1)
@@ -210,6 +251,13 @@ def calculate_ema(candles, period=21):
         ema = (close - ema) * multiplier + ema
     return ema
 
+# === RSI ===
+def calculate_rsi(candles, period=14):
+    closes = np.array([c[4] for c in candles])
+    if len(closes) < period:
+        return None
+    return talib.RSI(closes, timeperiod=period)[-1]
+
 # === PRICE ROUNDING ===
 def round_price(symbol, price):
     try:
@@ -223,25 +271,36 @@ def round_price(symbol, price):
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    c_big, c_small = candles[-2], candles[-1]
-    avg_volume = sum(c[5] for c in candles[-7:-2]) / 5
-    big_green = is_bullish(c_big) and body_pct(c_big) >= MIN_BIG_BODY_PCT and c_big[5] > avg_volume
-    small_red = (
-        is_bearish(c_small) and body_pct(c_small) <= MAX_SMALL_BODY_PCT and
-        lower_wick_pct(c_small) >= MIN_LOWER_WICK_PCT and
-        c_small[4] > c_big[3] + (c_big[2] - c_big[3]) * 0.3 and c_small[5] < c_big[5]
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_red_1 = (
+        is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
+        lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
+        c1[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    return big_green and small_red
+    small_red_0 = (
+        is_bearish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
+        lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT and
+        c0[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
+    )
+    volume_decreasing = c1[5] > c0[5]
+    return big_green and small_red_1 and small_red_0 and volume_decreasing
 
 def detect_falling_three(candles):
-    c_big, c_small = candles[-2], candles[-1]
-    avg_volume = sum(c[5] for c in candles[-7:-2]) / 5
-    big_red = is_bearish(c_big) and body_pct(c_big) >= MIN_BIG_BODY_PCT and c_big[5] > avg_volume
-    small_green = (
-        is_bullish(c_small) and body_pct(c_small) <= MAX_SMALL_BODY_PCT and
-        c_small[4] < c_big[2] - (c_big[2] - c_big[3]) * 0.3 and c_small[5] < c_big[5]
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_green_1 = (
+        is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
+        c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    return big_red and small_green
+    small_green_0 = (
+        is_bullish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
+        c0[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
+    )
+    volume_decreasing = c1[5] > c0[5]
+    return big_red and small_green_1 and small_green_0 and volume_decreasing
 
 # === SYMBOLS ===
 def get_symbols():
@@ -374,14 +433,17 @@ def process_symbol(symbol, alert_queue):
 
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
-        if ema21 is None or ema9 is None:
+        rsi = calculate_rsi(candles, period=RSI_PERIOD)
+        if ema21 is None or ema9 is None or rsi is None:
             return
 
-        signal_time = candles[-1][0]
-        first_small_candle_close = round_price(symbol, candles[-1][4])
+        signal_time = candles[-2][0]
+        first_small_candle_close = round_price(symbol, candles[-3][4])
+        second_small_candle_close = round_price(symbol, candles[-2][4])
+        big_candle_close = round_price(symbol, candles[-4][4])
 
         if detect_rising_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-1], 'rising')
+            first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'rising')) == signal_time:
@@ -409,6 +471,7 @@ def process_symbol(symbol, alert_queue):
                 f"{symbol} - {'REVERSED SELL' if side == 'sell' else 'RISING'} PATTERN\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
+                f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
                 f"entry - {entry_price}\n"
                 f"tp - {tp}\n"
@@ -418,7 +481,7 @@ def process_symbol(symbol, alert_queue):
             alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
 
         elif detect_falling_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-1], 'falling')
+            first_candle_analysis = analyze_first_small_candle(candles[-3], 'falling')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
                 return
             if sent_signals.get((symbol, 'falling')) == signal_time:
@@ -446,6 +509,7 @@ def process_symbol(symbol, alert_queue):
                 f"{symbol} - {'REVERSED BUY' if side == 'buy' else 'FALLING'} PATTERN\n"
                 f"Below 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 below 21 - {ema_status['ema9_ema21']}\n"
+                f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
                 f"entry - {entry_price}\n"
                 f"tp - {tp}\n"

@@ -3,7 +3,7 @@ import time
 import threading
 import requests
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
@@ -26,7 +26,7 @@ BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
-TP_PCT = 0.7 / 100  # Changed to 0.7%
+TP_PCT = 0.7 / 100
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
@@ -269,61 +269,83 @@ def round_price(symbol, price):
         print(f"Error rounding price for {symbol}: {e}")
         return price
 
-# === PATTERN DETECTION ===
+# === PATTERN DETECTION - COMPLETELY REWRITTEN ===
 def detect_rising_three(candles):
-    # Check pattern after first small candle closes (candles[-3])
+    """
+    Detect Rising Three pattern at the FIRST small candle close
+    Pattern: Big Green -> First Small Red (THIS is when we alert)
+    """
     if len(candles) < 5:
         return False
-        
-    c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
-    avg_volume = sum(c[5] for c in candles[-6:-2]) / min(4, len(candles[-6:-2]))  # Adjusted volume calculation
     
-    # Check big green candle
-    big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    # candles[-1] = current forming candle (ignore this)
+    # candles[-2] = previous candle (should be the first small red candle that just closed)
+    # candles[-3] = big green candle
+    # candles[-4] = candle before big green
     
-    # Check first small red candle (this is the candle that just closed)
-    first_small_red = (
-        is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
-        lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
-        c1[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
-    )
+    big_candle = candles[-3]  # The big green candle
+    first_small_candle = candles[-2]  # The first small red candle that JUST closed
     
-    # We only need the first small candle to be confirmed - alert immediately
-    return big_green and first_small_red
+    # Verify the big candle is indeed big and green
+    if not (is_bullish(big_candle) and body_pct(big_candle) >= MIN_BIG_BODY_PCT):
+        return False
+    
+    # Verify the first small candle is small and red
+    if not (is_bearish(first_small_candle) and body_pct(first_small_candle) <= MAX_SMALL_BODY_PCT):
+        return False
+    
+    # Check if first small candle is within the range of big candle
+    if first_small_candle[4] > big_candle[3] + (big_candle[2] - big_candle[3]) * 0.3:
+        return True
+    
+    return False
 
 def detect_falling_three(candles):
-    # Check pattern after first small candle closes (candles[-3])
+    """
+    Detect Falling Three pattern at the FIRST small candle close
+    Pattern: Big Red -> First Small Green (THIS is when we alert)
+    """
     if len(candles) < 5:
         return False
-        
-    c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
-    avg_volume = sum(c[5] for c in candles[-6:-2]) / min(4, len(candles[-6:-2]))  # Adjusted volume calculation
     
-    # Check big red candle
-    big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    # candles[-1] = current forming candle (ignore this)
+    # candles[-2] = previous candle (should be the first small green candle that just closed)
+    # candles[-3] = big red candle
+    # candles[-4] = candle before big red
     
-    # Check first small green candle (this is the candle that just closed)
-    first_small_green = (
-        is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
-        c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
-    )
+    big_candle = candles[-3]  # The big red candle
+    first_small_candle = candles[-2]  # The first small green candle that JUST closed
     
-    # We only need the first small candle to be confirmed - alert immediately
-    return big_red and first_small_green
+    # Verify the big candle is indeed big and red
+    if not (is_bearish(big_candle) and body_pct(big_candle) >= MIN_BIG_BODY_PCT):
+        return False
+    
+    # Verify the first small candle is small and green
+    if not (is_bullish(first_small_candle) and body_pct(first_small_candle) <= MAX_SMALL_BODY_PCT):
+        return False
+    
+    # Check if first small candle is within the range of big candle
+    if first_small_candle[4] < big_candle[2] - (big_candle[2] - big_candle[3]) * 0.3:
+        return True
+    
+    return False
 
 # === SYMBOLS ===
 def get_symbols():
     markets = exchange.load_markets()
     return [s for s in markets if 'USDT' in s and markets[s]['contract'] and markets[s].get('active') and markets[s].get('info', {}).get('status') == 'TRADING']
 
-# === CANDLE CLOSE ===
+# === CANDLE CLOSE TIMING ===
 def get_next_candle_close():
     now = get_ist_time()
     seconds = now.minute * 60 + now.second
     seconds_to_next = (15 * 60) - (seconds % (15 * 60))
-    if seconds_to_next < 5:
-        seconds_to_next += 15 * 60
     return time.time() + seconds_to_next
+
+def is_candle_close_time():
+    """Check if we're at a 15-minute candle close time (:00, :15, :30, :45)"""
+    now = get_ist_time()
+    return now.minute % 15 == 0 and now.second >= 0
 
 # === TP/SL CHECK ===
 def check_tp_sl():
@@ -334,57 +356,30 @@ def check_tp_sl():
                 for sym, trade in list(open_trades.items()):
                     try:
                         hit = ""
-                        pnl = 0
-                        hit_price = None
-
-                        entry_time = trade.get('entry_time')
-                        if entry_time:
-                            candles_1m = exchange.fetch_ohlcv(sym, '1m', since=entry_time, limit=2880)
-                            for c in candles_1m:
-                                high = c[2]
-                                low = c[3]
-                                if trade['side'] == 'buy':
-                                    if high >= trade['tp']:
-                                        hit = "✅ TP hit"
-                                        hit_price = trade['tp']
-                                        break
-                                    if low <= trade['sl']:
-                                        hit = "❌ SL hit"
-                                        hit_price = trade['sl']
-                                        break
-                                else:
-                                    if low <= trade['tp']:
-                                        hit = "✅ TP hit"
-                                        hit_price = trade['tp']
-                                        break
-                                    if high >= trade['sl']:
-                                        hit = "❌ SL hit"
-                                        hit_price = trade['sl']
-                                        break
-
-                        if not hit:
-                            ticker = exchange.fetch_ticker(sym)
-                            last = round_price(sym, ticker['last'])
-                            if trade['side'] == 'buy':
-                                if last >= trade['tp']:
-                                    hit = "✅ TP hit"
-                                    hit_price = trade['tp']
-                                elif last <= trade['sl']:
-                                    hit = "❌ SL hit"
-                                    hit_price = trade['sl']
-                            else:
-                                if last <= trade['tp']:
-                                    hit = "✅ TP hit"
-                                    hit_price = trade['tp']
-                                elif last >= trade['sl']:
-                                    hit = "❌ SL hit"
-                                    hit_price = trade['sl']
+                        ticker = exchange.fetch_ticker(sym)
+                        last = round_price(sym, ticker['last'])
+                        
+                        if trade['side'] == 'buy':
+                            if last >= trade['tp']:
+                                hit = "✅ TP hit"
+                                hit_price = trade['tp']
+                            elif last <= trade['sl']:
+                                hit = "❌ SL hit"
+                                hit_price = trade['sl']
+                        else:
+                            if last <= trade['tp']:
+                                hit = "✅ TP hit"
+                                hit_price = trade['tp']
+                            elif last >= trade['sl']:
+                                hit = "❌ SL hit"
+                                hit_price = trade['sl']
 
                         if hit:
                             if trade['side'] == 'buy':
                                 pnl = (hit_price - trade['entry']) / trade['entry'] * 100
                             else:
                                 pnl = (trade['entry'] - hit_price) / trade['entry'] * 100
+                            
                             logging.info(f"TP/SL hit for {sym}: {hit}, PnL: {pnl:.2f}%")
                             profit = CAPITAL * pnl / 100
                             closed_trade = {
@@ -399,24 +394,12 @@ def check_tp_sl():
                             }
                             closed_trades.append(closed_trade)
                             save_closed_trades(closed_trade)
-                            ema_status = trade['ema_status']
-                            new_msg = (
-                                f"{sym} - {'REVERSED SELL' if trade['side'] == 'sell' and trade['pattern'] == 'rising' else 'REVERSED BUY' if trade['side'] == 'buy' and trade['pattern'] == 'falling' else trade['pattern'].upper()} PATTERN\n"
-                                f"{'Above' if trade['pattern'] == 'rising' else 'Below'} 21 ema - {ema_status['price_ema21']}\n"
-                                f"ema 9 {'above' if trade['pattern'] == 'rising' else 'below'} 21 - {ema_status['ema9_ema21']}\n"
-                                f"First small candle: {trade['first_candle_analysis']}\n"
-                                f"entry - {trade['entry']}\n"
-                                f"tp - {trade['tp']}\n"
-                                f"sl - {trade['sl']}\n"
-                                f"Profit/Loss: {pnl:.2f}% (${profit:.2f})\n{hit}"
-                            )
-                            trade['msg'] = new_msg
-                            trade['hit'] = hit
-                            logging.info(f"Updating Telegram message for {sym}: {hit}")
+                            
+                            new_msg = f"{trade['msg']}\nProfit/Loss: {pnl:.2f}% (${profit:.2f})\n{hit}"
                             edit_telegram_message(trade['msg_id'], new_msg)
                             del open_trades[sym]
                             save_trades()
-                            logging.info(f"Trade closed for {sym}")
+                            
                     except Exception as e:
                         logging.error(f"TP/SL check error on {sym}: {e}")
             time.sleep(TP_SL_CHECK_INTERVAL)
@@ -427,39 +410,34 @@ def check_tp_sl():
 # === PROCESS SYMBOL ===
 def process_symbol(symbol, alert_queue):
     try:
-        # Get candles with proper error handling
-        candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
-        if len(candles) < 25:
+        # Get candles
+        candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=10)
+        if len(candles) < 5:
             return
 
-        # DEBUG: Print candle times to see what's happening
         current_time = get_ist_time()
-        latest_candle_time = datetime.fromtimestamp(candles[-1][0] / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
-        previous_candle_time = datetime.fromtimestamp(candles[-2][0] / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
-        first_small_candle_time = datetime.fromtimestamp(candles[-3][0] / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
+        print(f"🔍 {symbol} - Processing at {current_time.strftime('%H:%M:%S')} IST")
         
-        print(f"🔍 {symbol} - Current: {current_time.strftime('%H:%M:%S')}, Latest Candle: {latest_candle_time}, Prev: {previous_candle_time}, First Small: {first_small_candle_time}")
+        # Debug candle times
+        for i, candle in enumerate(candles[-5:]):
+            candle_time = datetime.fromtimestamp(candle[0] / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M')
+            print(f"  Candle {-5+i}: {candle_time} - O: {candle[1]}, H: {candle[2]}, L: {candle[3]}, C: {candle[4]}")
 
-        # Check if we're processing at the right time (should be right after candle close)
-        current_minute = current_time.minute
-        if current_minute % 15 != 0:  # Should be at :00, :15, :30, :45
-            print(f"⏰ Wrong timing - current minute: {current_minute}, should be at 15min interval")
-            return
-
+        # Calculate indicators
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
         rsi = calculate_rsi(candles, period=RSI_PERIOD)
         if ema21 is None or ema9 is None or rsi is None:
             return
 
-        # Use timestamp of the first small candle (candles[-3])
-        signal_time = candles[-3][0]  # This is the first small candle timestamp
-        first_small_candle_close = round_price(symbol, candles[-3][4])  # First small candle close price
+        # Use the candle that just closed (candles[-2])
+        signal_time = candles[-2][0]  # This is the first small candle timestamp
+        first_small_candle_close = round_price(symbol, candles[-2][4])
 
         if detect_rising_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
-            if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
-                return
+            print(f"🚨 RISING THREE DETECTED for {symbol}!")
+            first_candle_analysis = analyze_first_small_candle(candles[-2], 'rising')
+            
             if sent_signals.get((symbol, 'rising')) == signal_time:
                 return
             sent_signals[(symbol, 'rising')] = signal_time
@@ -470,39 +448,35 @@ def process_symbol(symbol, alert_queue):
                 'price_ema21': '✅' if price_above_ema21 else '❌',
                 'ema9_ema21': '✅' if ema9_above_ema21 else '❌'
             }
+            
             green_count = sum(1 for v in ema_status.values() if v == '✅')
-            if green_count == 2:
-                category = 'two_green'
-            elif green_count == 1:
-                category = 'one_green'
-            else:
-                category = 'two_cautions'
+            category = 'two_green' if green_count == 2 else 'one_green' if green_count == 1 else 'two_cautions'
+            
             side = 'sell'
             entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 - TP_PCT))  # Using 0.7% TP
+            tp = round_price(symbol, entry_price * (1 - TP_PCT))
             sl = round_price(symbol, entry_price * (1 + SL_PCT))
-            pattern = 'rising'
             
             alert_time = datetime.fromtimestamp(signal_time / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M')
             msg = (
-                f"{symbol} - {'REVERSED SELL' if side == 'sell' else 'RISING'} PATTERN\n"
+                f"{symbol} - RISING PATTERN\n"
                 f"Alert Time: {alert_time} (First Small Candle Close)\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
-                f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
+                f"EMA9 above EMA21 - {ema_status['ema9_ema21']}\n"
                 f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
-                f"entry - {entry_price}\n"
-                f"tp - {tp} (0.7%)\n"
-                f"sl - {sl}\n"
-                f"Trade going on..."
+                f"Entry: {entry_price}\n"
+                f"TP: {tp} (0.7%)\n"
+                f"SL: {sl}\n"
+                f"Trade active..."
             )
-            print(f"🚀 SENDING ALERT for {symbol} at {alert_time}")
-            alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
+            print(f"📤 Queueing alert for {symbol}")
+            alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], 'rising'))
 
         elif detect_falling_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-3], 'falling')
-            if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
-                return
+            print(f"🚨 FALLING THREE DETECTED for {symbol}!")
+            first_candle_analysis = analyze_first_small_candle(candles[-2], 'falling')
+            
             if sent_signals.get((symbol, 'falling')) == signal_time:
                 return
             sent_signals[(symbol, 'falling')] = signal_time
@@ -513,37 +487,31 @@ def process_symbol(symbol, alert_queue):
                 'price_ema21': '✅' if price_below_ema21 else '❌',
                 'ema9_ema21': '✅' if ema9_below_ema21 else '❌'
             }
+            
             green_count = sum(1 for v in ema_status.values() if v == '✅')
-            if green_count == 2:
-                category = 'two_green'
-            elif green_count == 1:
-                category = 'one_green'
-            else:
-                category = 'two_cautions'
+            category = 'two_green' if green_count == 2 else 'one_green' if green_count == 1 else 'two_cautions'
+            
             side = 'buy'
             entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 + TP_PCT))  # Using 0.7% TP
+            tp = round_price(symbol, entry_price * (1 + TP_PCT))
             sl = round_price(symbol, entry_price * (1 - SL_PCT))
-            pattern = 'falling'
             
             alert_time = datetime.fromtimestamp(signal_time / 1000).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%H:%M')
             msg = (
-                f"{symbol} - {'REVERSED BUY' if side == 'buy' else 'FALLING'} PATTERN\n"
+                f"{symbol} - FALLING PATTERN\n"
                 f"Alert Time: {alert_time} (First Small Candle Close)\n"
                 f"Below 21 ema - {ema_status['price_ema21']}\n"
-                f"ema 9 below 21 - {ema_status['ema9_ema21']}\n"
+                f"EMA9 below EMA21 - {ema_status['ema9_ema21']}\n"
                 f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
-                f"entry - {entry_price}\n"
-                f"tp - {tp} (0.7%)\n"
-                f"sl - {sl}\n"
-                f"Trade going on..."
+                f"Entry: {entry_price}\n"
+                f"TP: {tp} (0.7%)\n"
+                f"SL: {sl}\n"
+                f"Trade active..."
             )
-            print(f"🚀 SENDING ALERT for {symbol} at {alert_time}")
-            alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
+            print(f"📤 Queueing alert for {symbol}")
+            alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], 'falling'))
 
-    except ccxt.RateLimitExceeded:
-        time.sleep(5)
     except Exception as e:
         logging.error(f"Error on {symbol}: {e}")
 
@@ -590,46 +558,10 @@ def scan_loop():
                             }
                             open_trades[symbol] = trade
                             save_trades()
-                            logging.info(f"New trade opened for {symbol} at first small candle close")
-                    else:
-                        lowest_priority = min(
-                            (CATEGORY_PRIORITY[trade['category']] for trade in open_trades.values()),
-                            default=0
-                        )
-                        if CATEGORY_PRIORITY[category] > lowest_priority:
-                            for sym, trade in list(open_trades.items()):
-                                if CATEGORY_PRIORITY[trade['category']] == lowest_priority:
-                                    edit_telegram_message(
-                                        trade['msg_id'],
-                                        f"{sym} - Trade canceled for higher-priority signal."
-                                    )
-                                    del open_trades[sym]
-                                    save_trades()
-                                    mid = send_telegram(msg)
-                                    if mid and symbol not in open_trades:
-                                        trade = {
-                                            'side': side,
-                                            'entry': entry_price,
-                                            'tp': tp,
-                                            'sl': sl,
-                                            'msg': msg,
-                                            'msg_id': mid,
-                                            'ema_status': ema_status,
-                                            'category': category,
-                                            'first_candle_analysis': first_candle_analysis,
-                                            'pressure_status': pressure_status,
-                                            'body_pct': body_pct,
-                                            'entry_time': int(time.time() * 1000),
-                                            'pattern': pattern
-                                        }
-                                        open_trades[symbol] = trade
-                                        save_trades()
-                                        logging.info(f"Replaced trade with higher priority for {symbol}")
-                                    break
+                            print(f"✅ Trade opened for {symbol}")
                     alert_queue.task_done()
             except queue.Empty:
                 time.sleep(1)
-                continue
             except Exception as e:
                 logging.error(f"Alert thread error: {e}")
                 time.sleep(1)
@@ -637,14 +569,14 @@ def scan_loop():
     threading.Thread(target=send_alerts, daemon=True).start()
     threading.Thread(target=check_tp_sl, daemon=True).start()
 
-    # Wait for the first proper 15-minute interval
+    # Wait for first proper candle close
     print("⏳ Waiting for next 15-minute candle close...")
     next_close = get_next_candle_close()
     time.sleep(max(0, next_close - time.time()))
 
     while True:
         current_time = get_ist_time()
-        print(f"🕒 Scanning at {current_time.strftime('%H:%M:%S')} IST")
+        print(f"\n🎯 SCANNING at {current_time.strftime('%H:%M:%S')} IST (Candle just closed)")
         
         # Process all symbols
         for i, chunk in enumerate(symbol_chunks):
@@ -653,21 +585,12 @@ def scan_loop():
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
 
-        print("✅ Scan complete.")
-        num_open = len(open_trades)
-        print(f"💎 Number of open trades: {num_open}")
-
-        # Summary logic (keep your existing summary code)
-        current_unix_time = time.time()
-        if current_unix_time - last_summary_time >= SUMMARY_INTERVAL:
-            # ... (your existing summary code) ...
-            last_summary_time = current_unix_time
-            closed_trades = []
-
-        # Wait for the next 15-minute candle close
+        print("✅ Scan complete. Waiting for next candle close...")
+        
+        # Wait for next candle close
         next_close = get_next_candle_close()
         wait_time = max(0, next_close - time.time())
-        print(f"⏰ Waiting {wait_time:.1f} seconds for next candle close...")
+        print(f"⏰ Next scan in {wait_time:.1f} seconds...")
         time.sleep(wait_time)
 
 # === FLASK ===

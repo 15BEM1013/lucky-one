@@ -26,7 +26,7 @@ BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 CAPITAL = 10.0
 SL_PCT = 1.5 / 100
-TP_PCT = 0.7 / 100  # CHANGED TO 0.7%
+TP_PCT = 0.7 / 100  # Changed to 0.7%
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
@@ -213,32 +213,32 @@ def analyze_first_small_candle(candle, pattern_type):
 
     if pattern_type == 'rising':
         if wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
+            return {'text': f"Selling pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
         elif wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
+            return {'text': f"Buying pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
         elif body >= 0.1:
             if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
+                return {'text': f"Buying pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
             elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
+                return {'text': f"Selling pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
             else:
-                return {'text': f"Neutral âœ…\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
         else:
-            return {'text': f"Neutral âœ…\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
     elif pattern_type == 'falling':
         if wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
+            return {'text': f"Buying pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
         elif wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
+            return {'text': f"Selling pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
         elif body >= 0.1:
             if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
+                return {'text': f"Buying pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
             elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure âš ï¸\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
+                return {'text': f"Selling pressure ❌\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
             else:
-                return {'text': f"Neutral âœ…\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
         else:
-            return {'text': f"Neutral âœ…\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
 
 # === EMA ===
 def calculate_ema(candles, period=21):
@@ -271,14 +271,14 @@ def round_price(symbol, price):
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    # MODIFIED: Check pattern after first small candle closes (candles[-3])
+    # Check pattern after first small candle closes (candles[-3])
     c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
     avg_volume = sum(c[5] for c in candles[-6:-2]) / 4  # Adjusted volume calculation
     
     # Check big green candle
     big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     
-    # Check first small red candle (this is the candle that just closed at 14:15)
+    # Check first small red candle (this is the candle that just closed)
     first_small_red = (
         is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
@@ -289,14 +289,14 @@ def detect_rising_three(candles):
     return big_green and first_small_red
 
 def detect_falling_three(candles):
-    # MODIFIED: Check pattern after first small candle closes (candles[-3])
+    # Check pattern after first small candle closes (candles[-3])
     c2, c1 = candles[-4], candles[-3]  # Big candle and first small candle
     avg_volume = sum(c[5] for c in candles[-6:-2]) / 4  # Adjusted volume calculation
     
     # Check big red candle
     big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     
-    # Check first small green candle (this is the candle that just closed at 14:15)
+    # Check first small green candle (this is the candle that just closed)
     first_small_green = (
         is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
@@ -339,20 +339,20 @@ def check_tp_sl():
                                 low = c[3]
                                 if trade['side'] == 'buy':
                                     if high >= trade['tp']:
-                                        hit = "âœ… TP hit"
+                                        hit = "✅ TP hit"
                                         hit_price = trade['tp']
                                         break
                                     if low <= trade['sl']:
-                                        hit = "âŒ SL hit"
+                                        hit = "❌ SL hit"
                                         hit_price = trade['sl']
                                         break
                                 else:
                                     if low <= trade['tp']:
-                                        hit = "âœ… TP hit"
+                                        hit = "✅ TP hit"
                                         hit_price = trade['tp']
                                         break
                                     if high >= trade['sl']:
-                                        hit = "âŒ SL hit"
+                                        hit = "❌ SL hit"
                                         hit_price = trade['sl']
                                         break
 
@@ -361,17 +361,17 @@ def check_tp_sl():
                             last = round_price(sym, ticker['last'])
                             if trade['side'] == 'buy':
                                 if last >= trade['tp']:
-                                    hit = "âœ… TP hit"
+                                    hit = "✅ TP hit"
                                     hit_price = trade['tp']
                                 elif last <= trade['sl']:
-                                    hit = "âŒ SL hit"
+                                    hit = "❌ SL hit"
                                     hit_price = trade['sl']
                             else:
                                 if last <= trade['tp']:
-                                    hit = "âœ… TP hit"
+                                    hit = "✅ TP hit"
                                     hit_price = trade['tp']
                                 elif last >= trade['sl']:
-                                    hit = "âŒ SL hit"
+                                    hit = "❌ SL hit"
                                     hit_price = trade['sl']
 
                         if hit:
@@ -434,15 +434,22 @@ def process_symbol(symbol, alert_queue):
                 time.sleep(2 ** attempt)
                 continue
 
+        # DEBUG: Print candle times to see what's happening
+        latest_candle_time = datetime.fromtimestamp(candles[-1][0] / 1000).strftime('%H:%M')
+        previous_candle_time = datetime.fromtimestamp(candles[-2][0] / 1000).strftime('%H:%M')
+        first_small_candle_time = datetime.fromtimestamp(candles[-3][0] / 1000).strftime('%H:%M')
+        
+        print(f"🔍 {symbol} - Latest: {latest_candle_time}, Prev: {previous_candle_time}, First Small: {first_small_candle_time}")
+
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
         rsi = calculate_rsi(candles, period=RSI_PERIOD)
         if ema21 is None or ema9 is None or rsi is None:
             return
 
-        # MODIFIED: Use timestamp of the first small candle (candles[-3])
-        signal_time = candles[-3][0]  # This is the 14:15 candle timestamp
-        first_small_candle_close = round_price(symbol, candles[-3][4])  # 14:15 close price
+        # Use timestamp of the first small candle (candles[-3])
+        signal_time = candles[-3][0]  # This is the first small candle timestamp
+        first_small_candle_close = round_price(symbol, candles[-3][4])  # First small candle close price
 
         if detect_rising_three(candles):
             first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
@@ -454,10 +461,10 @@ def process_symbol(symbol, alert_queue):
             price_above_ema21 = first_small_candle_close > ema21
             ema9_above_ema21 = ema9 > ema21
             ema_status = {
-                'price_ema21': 'âœ…' if price_above_ema21 else 'âš ï¸',
-                'ema9_ema21': 'âœ…' if ema9_above_ema21 else 'âš ï¸'
+                'price_ema21': '✅' if price_above_ema21 else '❌',
+                'ema9_ema21': '✅' if ema9_above_ema21 else '❌'
             }
-            green_count = sum(1 for v in ema_status.values() if v == 'âœ…')
+            green_count = sum(1 for v in ema_status.values() if v == '✅')
             if green_count == 2:
                 category = 'two_green'
             elif green_count == 1:
@@ -466,12 +473,14 @@ def process_symbol(symbol, alert_queue):
                 category = 'two_cautions'
             side = 'sell'
             entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 - TP_PCT))  # Now using 0.7% TP
+            tp = round_price(symbol, entry_price * (1 - TP_PCT))  # Using 0.7% TP
             sl = round_price(symbol, entry_price * (1 + SL_PCT))
             pattern = 'rising'
+            
+            alert_time = datetime.fromtimestamp(signal_time / 1000).strftime('%H:%M')
             msg = (
                 f"{symbol} - {'REVERSED SELL' if side == 'sell' else 'RISING'} PATTERN\n"
-                f"Alert Time: 14:15 (First Small Candle Close)\n"
+                f"Alert Time: {alert_time} (First Small Candle Close)\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
                 f"RSI: {rsi:.2f}\n"
@@ -493,10 +502,10 @@ def process_symbol(symbol, alert_queue):
             price_below_ema21 = first_small_candle_close < ema21
             ema9_below_ema21 = ema9 < ema21
             ema_status = {
-                'price_ema21': 'âœ…' if price_below_ema21 else 'âš ï¸',
-                'ema9_ema21': 'âœ…' if ema9_below_ema21 else 'âš ï¸'
+                'price_ema21': '✅' if price_below_ema21 else '❌',
+                'ema9_ema21': '✅' if ema9_below_ema21 else '❌'
             }
-            green_count = sum(1 for v in ema_status.values() if v == 'âœ…')
+            green_count = sum(1 for v in ema_status.values() if v == '✅')
             if green_count == 2:
                 category = 'two_green'
             elif green_count == 1:
@@ -505,12 +514,14 @@ def process_symbol(symbol, alert_queue):
                 category = 'two_cautions'
             side = 'buy'
             entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 + TP_PCT))  # Now using 0.7% TP
+            tp = round_price(symbol, entry_price * (1 + TP_PCT))  # Using 0.7% TP
             sl = round_price(symbol, entry_price * (1 - SL_PCT))
             pattern = 'falling'
+            
+            alert_time = datetime.fromtimestamp(signal_time / 1000).strftime('%H:%M')
             msg = (
                 f"{symbol} - {'REVERSED BUY' if side == 'buy' else 'FALLING'} PATTERN\n"
-                f"Alert Time: 14:15 (First Small Candle Close)\n"
+                f"Alert Time: {alert_time} (First Small Candle Close)\n"
                 f"Below 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 below 21 - {ema_status['ema9_ema21']}\n"
                 f"RSI: {rsi:.2f}\n"
@@ -539,7 +550,7 @@ def scan_loop():
     global closed_trades, last_summary_time
     load_trades()
     symbols = get_symbols()
-    print(f"ðŸ” Scanning {len(symbols)} Binance Futures symbols...")
+    print(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
     alert_queue = queue.Queue()
 
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
@@ -570,7 +581,7 @@ def scan_loop():
                             }
                             open_trades[symbol] = trade
                             save_trades()
-                            logging.info(f"New trade opened for {symbol}")
+                            logging.info(f"New trade opened for {symbol} at first small candle close")
                     else:
                         lowest_priority = min(
                             (CATEGORY_PRIORITY[trade['category']] for trade in open_trades.values()),
@@ -622,21 +633,32 @@ def scan_loop():
     threading.Thread(target=send_alerts, daemon=True).start()
     threading.Thread(target=check_tp_sl, daemon=True).start()
 
+    # Immediate scanning after startup
+    print("🚀 Starting immediate scan...")
+    for i, chunk in enumerate(symbol_chunks):
+        print(f"Processing initial batch {i+1}/{NUM_CHUNKS}...")
+        process_batch(chunk, alert_queue)
+        if i < NUM_CHUNKS - 1:
+            time.sleep(BATCH_DELAY)
+
     while True:
+        # Wait for the NEXT candle close
         next_close = get_next_candle_close()
         wait_time = max(0, next_close - time.time())
-        print(f"â³ Waiting {wait_time:.1f} seconds for next 15m candle close...")
+        print(f"⏰ Waiting {wait_time:.1f} seconds for next 15m candle close...")
         time.sleep(wait_time)
 
+        # Scan immediately after candle close
+        print("🕒 Candle closed! Scanning immediately...")
         for i, chunk in enumerate(symbol_chunks):
             print(f"Processing batch {i+1}/{NUM_CHUNKS}...")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
 
-        print("âœ… Scan complete.")
+        print("✅ Scan complete.")
         num_open = len(open_trades)
-        print(f"ðŸ“Š Number of open trades: {num_open}")
+        print(f"💎 Number of open trades: {num_open}")
 
         current_time = time.time()
         if current_time - last_summary_time >= SUMMARY_INTERVAL:
@@ -656,8 +678,8 @@ def scan_loop():
                     count = len(trade_list)
                     wins = sum(1 for t in trade_list if t.get('pnl', 0) > 0)
                     losses = sum(1 for t in trade_list if t.get('pnl', 0) < 0)
-                    tp_hits = sum(1 for t in trade_list if t.get('hit') == 'âœ… TP hit')
-                    sl_hits = sum(1 for t in trade_list if t.get('hit') == 'âŒ SL hit')
+                    tp_hits = sum(1 for t in trade_list if t.get('hit') == '✅ TP hit')
+                    sl_hits = sum(1 for t in trade_list if t.get('hit') == '❌ SL hit')
                     pnl = sum(t.get('pnl', 0) for t in trade_list)
                     pnl_pct = sum(t.get('pnl_pct', 0) for t in trade_list)
                     win_rate = (wins / count * 100) if count > 0 else 0.00
@@ -701,30 +723,30 @@ def scan_loop():
 
             timestamp = get_ist_time().strftime("%I:%M %p IST, %B %d, %Y")
             summary_msg = (
-                f"ðŸ” Hourly Summary at {timestamp}\n"
-                f"ðŸ“Š Trade Summary (Closed Trades):\n"
-                f"- âœ…âœ… Two Green Ticks:\n"
-                f"  - Neutral âœ…: {two_green_metrics['small_body']['neutral'][0]} trades (W: {two_green_metrics['small_body']['neutral'][1]}, L: {two_green_metrics['small_body']['neutral'][2]}, TP: {two_green_metrics['small_body']['neutral'][3]}, SL: {two_green_metrics['small_body']['neutral'][4]}), PnL: ${two_green_metrics['small_body']['neutral'][5]:.2f} ({two_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"  - Selling Pressure âš ï¸: {two_green_metrics['small_body']['selling'][0]} trades (W: {two_green_metrics['small_body']['selling'][1]}, L: {two_green_metrics['small_body']['selling'][2]}, TP: {two_green_metrics['small_body']['selling'][3]}, SL: {two_green_metrics['small_body']['selling'][4]}), PnL: ${two_green_metrics['small_body']['selling'][5]:.2f} ({two_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"  - Buying Pressure âš ï¸: {two_green_metrics['small_body']['buying'][0]} trades (W: {two_green_metrics['small_body']['buying'][1]}, L: {two_green_metrics['small_body']['buying'][2]}, TP: {two_green_metrics['small_body']['buying'][3]}, SL: {two_green_metrics['small_body']['buying'][4]}), PnL: ${two_green_metrics['small_body']['buying'][5]:.2f} ({two_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"🔍 Hourly Summary at {timestamp}\n"
+                f"💎 Trade Summary (Closed Trades):\n"
+                f"- ✅✅ Two Green Ticks:\n"
+                f"  - Neutral ✅: {two_green_metrics['small_body']['neutral'][0]} trades (W: {two_green_metrics['small_body']['neutral'][1]}, L: {two_green_metrics['small_body']['neutral'][2]}, TP: {two_green_metrics['small_body']['neutral'][3]}, SL: {two_green_metrics['small_body']['neutral'][4]}), PnL: ${two_green_metrics['small_body']['neutral'][5]:.2f} ({two_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ❌: {two_green_metrics['small_body']['selling'][0]} trades (W: {two_green_metrics['small_body']['selling'][1]}, L: {two_green_metrics['small_body']['selling'][2]}, TP: {two_green_metrics['small_body']['selling'][3]}, SL: {two_green_metrics['small_body']['selling'][4]}), PnL: ${two_green_metrics['small_body']['selling'][5]:.2f} ({two_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ❌: {two_green_metrics['small_body']['buying'][0]} trades (W: {two_green_metrics['small_body']['buying'][1]}, L: {two_green_metrics['small_body']['buying'][2]}, TP: {two_green_metrics['small_body']['buying'][3]}, SL: {two_green_metrics['small_body']['buying'][4]}), PnL: ${two_green_metrics['small_body']['buying'][5]:.2f} ({two_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['buying'][7]:.2f}%\n"
                 f"  - Total: {two_green_metrics['small_body']['total'][0]} trades (W: {two_green_metrics['small_body']['total'][1]}, L: {two_green_metrics['small_body']['total'][2]}, TP: {two_green_metrics['small_body']['total'][3]}, SL: {two_green_metrics['small_body']['total'][4]}), PnL: ${two_green_metrics['small_body']['total'][5]:.2f} ({two_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {two_green_metrics['total'][0]} trades (W: {two_green_metrics['total'][1]}, L: {two_green_metrics['total'][2]}, TP: {two_green_metrics['total'][3]}, SL: {two_green_metrics['total'][4]}), PnL: ${two_green_metrics['total'][5]:.2f} ({two_green_metrics['total'][6]:.2f}%), Win Rate: {two_green_metrics['total'][7]:.2f}%\n"
-                f"- âœ…âš ï¸ One Green One Caution:\n"
-                f"  - Neutral âœ…: {one_green_metrics['small_body']['neutral'][0]} trades (W: {one_green_metrics['small_body']['neutral'][1]}, L: {one_green_metrics['small_body']['neutral'][2]}, TP: {one_green_metrics['small_body']['neutral'][3]}, SL: {one_green_metrics['small_body']['neutral'][4]}), PnL: ${one_green_metrics['small_body']['neutral'][5]:.2f} ({one_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"  - Selling Pressure âš ï¸: {one_green_metrics['small_body']['selling'][0]} trades (W: {one_green_metrics['small_body']['selling'][1]}, L: {one_green_metrics['small_body']['selling'][2]}, TP: {one_green_metrics['small_body']['selling'][3]}, SL: {one_green_metrics['small_body']['selling'][4]}), PnL: ${one_green_metrics['small_body']['selling'][5]:.2f} ({one_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"  - Buying Pressure âš ï¸: {one_green_metrics['small_body']['buying'][0]} trades (W: {one_green_metrics['small_body']['buying'][1]}, L: {one_green_metrics['small_body']['buying'][2]}, TP: {one_green_metrics['small_body']['buying'][3]}, SL: {one_green_metrics['small_body']['buying'][4]}), PnL: ${one_green_metrics['small_body']['buying'][5]:.2f} ({one_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"- ✅❌ One Green One Caution:\n"
+                f"  - Neutral ✅: {one_green_metrics['small_body']['neutral'][0]} trades (W: {one_green_metrics['small_body']['neutral'][1]}, L: {one_green_metrics['small_body']['neutral'][2]}, TP: {one_green_metrics['small_body']['neutral'][3]}, SL: {one_green_metrics['small_body']['neutral'][4]}), PnL: ${one_green_metrics['small_body']['neutral'][5]:.2f} ({one_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ❌: {one_green_metrics['small_body']['selling'][0]} trades (W: {one_green_metrics['small_body']['selling'][1]}, L: {one_green_metrics['small_body']['selling'][2]}, TP: {one_green_metrics['small_body']['selling'][3]}, SL: {one_green_metrics['small_body']['selling'][4]}), PnL: ${one_green_metrics['small_body']['selling'][5]:.2f} ({one_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ❌: {one_green_metrics['small_body']['buying'][0]} trades (W: {one_green_metrics['small_body']['buying'][1]}, L: {one_green_metrics['small_body']['buying'][2]}, TP: {one_green_metrics['small_body']['buying'][3]}, SL: {one_green_metrics['small_body']['buying'][4]}), PnL: ${one_green_metrics['small_body']['buying'][5]:.2f} ({one_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['buying'][7]:.2f}%\n"
                 f"  - Total: {one_green_metrics['small_body']['total'][0]} trades (W: {one_green_metrics['small_body']['total'][1]}, L: {one_green_metrics['small_body']['total'][2]}, TP: {one_green_metrics['small_body']['total'][3]}, SL: {one_green_metrics['small_body']['total'][4]}), PnL: ${one_green_metrics['small_body']['total'][5]:.2f} ({one_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {one_green_metrics['total'][0]} trades (W: {one_green_metrics['total'][1]}, L: {one_green_metrics['total'][2]}, TP: {one_green_metrics['total'][3]}, SL: {one_green_metrics['total'][4]}), PnL: ${one_green_metrics['total'][5]:.2f} ({one_green_metrics['total'][6]:.2f}%), Win Rate: {one_green_metrics['total'][7]:.2f}%\n"
-                f"- âš ï¸âš ï¸ Two Cautions:\n"
-                f"  - Neutral âœ…: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"  - Selling Pressure âš ï¸: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"  - Buying Pressure âš ï¸: {two_cautions_metrics['small_body']['buying'][0]} trades (W: {two_cautions_metrics['small_body']['buying'][1]}, L: {two_cautions_metrics['small_body']['buying'][2]}, TP: {two_cautions_metrics['small_body']['buying'][3]}, SL: {two_cautions_metrics['small_body']['buying'][4]}), PnL: ${two_cautions_metrics['small_body']['buying'][5]:.2f} ({two_cautions_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"- ❌❌ Two Cautions:\n"
+                f"  - Neutral ✅: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ❌: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ❌: {two_cautions_metrics['small_body']['buying'][0]} trades (W: {two_cautions_metrics['small_body']['buying'][1]}, L: {two_cautions_metrics['small_body']['buying'][2]}, TP: {two_cautions_metrics['small_body']['buying'][3]}, SL: {two_cautions_metrics['small_body']['buying'][4]}), PnL: ${two_cautions_metrics['small_body']['buying'][5]:.2f} ({two_cautions_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['buying'][7]:.2f}%\n"
                 f"  - Total: {two_cautions_metrics['small_body']['total'][0]} trades (W: {two_cautions_metrics['small_body']['total'][1]}, L: {two_cautions_metrics['small_body']['total'][2]}, TP: {two_cautions_metrics['small_body']['total'][3]}, SL: {two_cautions_metrics['small_body']['total'][4]}), PnL: ${two_cautions_metrics['small_body']['total'][5]:.2f} ({two_cautions_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {two_cautions_metrics['total'][0]} trades (W: {two_cautions_metrics['total'][1]}, L: {two_cautions_metrics['total'][2]}, TP: {two_cautions_metrics['total'][3]}, SL: {two_cautions_metrics['total'][4]}), PnL: ${two_cautions_metrics['total'][5]:.2f} ({two_cautions_metrics['total'][6]:.2f}%), Win Rate: {two_cautions_metrics['total'][7]:.2f}%\n"
-                f"ðŸ’° Total Executed PnL: ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
-                f"ðŸ“ˆ Cumulative Executed PnL: ${cumulative_pnl:.2f} ({cumulative_pnl_pct:.2f}%)\n"
-                f"ðŸ† Top Symbol: {top_symbol_name or 'None'} with ${top_symbol_pnl:.2f} ({top_symbol_pnl_pct:.2f}%)\n"
-                f"ðŸ”„ Open Trades: {num_open}"
+                f"💰 Total Executed PnL: ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
+                f"📈 Cumulative Executed PnL: ${cumulative_pnl:.2f} ({cumulative_pnl_pct:.2f}%)\n"
+                f"🏆 Top Symbol: {top_symbol_name or 'None'} with ${top_symbol_pnl:.2f} ({top_symbol_pnl_pct:.2f}%)\n"
+                f"🔓 Open Trades: {num_open}"
             )
             send_telegram(summary_msg)
             send_telegram(f"Number of open trades after scan: {num_open}")
@@ -734,7 +756,7 @@ def scan_loop():
 # === FLASK ===
 @app.route('/')
 def home():
-    return "âœ… Rising & Falling Three Pattern Bot is Live!"
+    return "✅ Rising & Falling Three Pattern Bot is Live!"
 
 # === RUN ===
 def run_bot():

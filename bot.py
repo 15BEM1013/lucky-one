@@ -5,9 +5,7 @@ import requests
 from flask import Flask
 from datetime import datetime
 import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
-import queue
 import json
 import os
 import talib
@@ -59,9 +57,8 @@ def save_trades():
     try:
         with open(TRADE_FILE, 'w') as f:
             json.dump(open_trades, f, default=str)
-        print(f"Trades saved to {TRADE_FILE}")
     except Exception as e:
-        print(f"Error saving trades: {e}")
+        logging.error(f"Error saving trades: {e}")
 
 def load_trades():
     global open_trades
@@ -70,9 +67,8 @@ def load_trades():
             with open(TRADE_FILE, 'r') as f:
                 loaded = json.load(f)
                 open_trades = {k: v for k, v in loaded.items()}
-            print(f"Loaded {len(open_trades)} trades from {TRADE_FILE}")
     except Exception as e:
-        print(f"Error loading trades: {e}")
+        logging.error(f"Error loading trades: {e}")
         open_trades = {}
 
 def save_closed_trades(closed_trade):
@@ -84,9 +80,8 @@ def save_closed_trades(closed_trade):
         all_closed_trades.append(closed_trade)
         with open(CLOSED_TRADE_FILE, 'w') as f:
             json.dump(all_closed_trades, f, default=str)
-        print(f"Closed trade saved to {CLOSED_TRADE_FILE}")
     except Exception as e:
-        print(f"Error saving closed trades: {e}")
+        logging.error(f"Error saving closed trades: {e}")
 
 def load_closed_trades():
     try:
@@ -95,7 +90,7 @@ def load_closed_trades():
                 return json.load(f)
         return []
     except Exception as e:
-        print(f"Error loading closed trades: {e}")
+        logging.error(f"Error loading closed trades: {e}")
         return []
 
 # === TELEGRAM ===
@@ -104,10 +99,9 @@ def send_telegram(msg):
     data = {'chat_id': CHAT_ID, 'text': msg}
     try:
         response = requests.post(url, data=data, timeout=5).json()
-        print(f"Telegram sent: {msg}")
         return response.get('result', {}).get('message_id')
     except Exception as e:
-        print(f"Telegram error: {e}")
+        logging.error(f"Telegram error: {e}")
         return None
 
 def edit_telegram_message(message_id, new_text):
@@ -115,9 +109,8 @@ def edit_telegram_message(message_id, new_text):
     data = {'chat_id': CHAT_ID, 'message_id': message_id, 'text': new_text}
     try:
         requests.post(url, data=data, timeout=5)
-        print(f"Telegram updated: {new_text}")
     except Exception as e:
-        print(f"Edit error: {e}")
+        logging.error(f"Edit error: {e}")
 
 # === INIT ===
 def initialize_exchange():
@@ -175,32 +168,51 @@ def analyze_first_small_candle(candle, pattern_type):
 
     if pattern_type == 'rising':
         if wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
+            return {'text': f"Selling pressure ⚠️", 'status': 'selling_pressure', 'body_pct': body}
         elif wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
-        elif body >= 0.1:
-            if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
-            elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
-            else:
-                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Buying pressure ⚠️", 'status': 'buying_pressure', 'body_pct': body}
         else:
-            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Neutral ✅", 'status': 'neutral', 'body_pct': body}
 
     elif pattern_type == 'falling':
         if wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
+            return {'text': f"Buying pressure ⚠️", 'status': 'buying_pressure', 'body_pct': body}
         elif wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
-        elif body >= 0.1:
-            if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure', 'body_pct': body}
-            elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure', 'body_pct': body}
-            else:
-                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Selling pressure ⚠️", 'status': 'selling_pressure', 'body_pct': body}
         else:
-            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral', 'body_pct': body}
+            return {'text': f"Neutral ✅", 'status': 'neutral', 'body_pct': body}
 
-# === The rest of the bot (EMA, RSI, detect patterns, TP/SL checks, scan_loop, Flask, run_bot) stays unchanged ===
+# === SCAN LOOP (placeholder for your real logic) ===
+def scan_loop():
+    while True:
+        try:
+            # your real scanning + trading logic goes here
+            logging.info("Scanning markets...")
+            time.sleep(10)
+        except Exception as e:
+            logging.error(f"Error in scan_loop: {e}")
+            time.sleep(5)
+
+# === FLASK ROUTE ===
+@app.route("/")
+def home():
+    return "Bot is running ✅", 200
+
+# === BOT RUNNER ===
+def run_bot():
+    global last_summary_time
+    load_trades()
+    num_open = len(open_trades)
+    last_summary_time = time.time()
+    startup_msg = f"BOT STARTED\nNumber of open trades: {num_open}"
+    send_telegram(startup_msg)
+
+    # Start scanning in a background thread
+    threading.Thread(target=scan_loop, daemon=True).start()
+
+    # Run Flask on Render's required $PORT
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    run_bot()

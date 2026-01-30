@@ -163,8 +163,8 @@ def initialize_exchange():
     logging.error("All proxies failed. Falling back to direct connection.")
     try:
         exchange = ccxt.binance({
-            'apiKey': 'YOUR_API_KEY_HERE',  # INSERT YOUR REAL API KEY
-            'secret': 'YOUR_API_SECRET_HERE',  # INSERT YOUR REAL API SECRET
+            'apiKey': 'T9inhK51iTAStVD0td5vZQwbB1OtX54AhYx12Q7rM1VdgfpYnklaUP2gTF0mGj3Z',  # INSERT YOUR REAL API KEY
+            'secret': 'H1GkoQm8HeIKCYZSVhbtkVn2DUmUKdHXBjqH5vUEwLXRmRnJ29CXoXnz66eFplNZ',  # INSERT YOUR REAL API SECRET
             'options': {'defaultType': 'future'},
             'enableRateLimit': True
             # For testnet: uncomment below and use testnet keys

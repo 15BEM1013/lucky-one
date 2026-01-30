@@ -24,20 +24,35 @@ MIN_LOWER_WICK_PCT = 20.0
 MAX_WORKERS = 5
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
-CAPITAL = 10.0
-SL_PCT = 1.5 / 100
-TP_PCT = 0.7 / 100
+CAPITAL = 8.0  # USDT margin per trade
+LEVERAGE = 5
+SL_PCT = 3.0 / 100
+TP_PCT = 1.0 / 100
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
 MAX_OPEN_TRADES = 5
 CATEGORY_PRIORITY = {
     'two_green': 3,
-    'one_green_one_caution': 2,
+    'one_green': 2,
     'two_cautions': 1
 }
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 80
+RSI_OVERSOLD = 30
 BODY_SIZE_THRESHOLD = 0.1
 SUMMARY_INTERVAL = 3600
+
+# === PROXY CONFIGURATION ===
+PROXY_LIST = [
+   
+]
+
+def get_proxy_config(proxy):
+    return {
+        "http": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}",
+        "https": f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+    }
 
 # === CONFIGURE LOGGING ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -99,7 +114,7 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {'chat_id': CHAT_ID, 'text': msg}
     try:
-        response = requests.post(url, data=data, timeout=5).json()
+        response = requests.post(url, data=data, timeout=5, proxies=proxies).json()
         print(f"Telegram sent: {msg}")
         return response.get('result', {}).get('message_id')
     except Exception as e:
@@ -110,7 +125,7 @@ def edit_telegram_message(message_id, new_text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     data = {'chat_id': CHAT_ID, 'message_id': message_id, 'text': new_text}
     try:
-        requests.post(url, data=data, timeout=5)
+        requests.post(url, data=data, timeout=5, proxies=proxies)
         print(f"Telegram updated: {new_text}")
     except Exception as e:
         print(f"Edit error: {e}")
@@ -120,17 +135,47 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 def initialize_exchange():
+    global proxies
+    proxies = None
+    for proxy in PROXY_LIST:
+        try:
+            proxies = get_proxy_config(proxy)
+            logging.info(f"Trying proxy: {proxy['host']}:{proxy['port']}")
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(pool_maxsize=20, max_retries=retries))
+            exchange = ccxt.binance({
+                'apiKey': 'T9inhK51iTAStVD0td5vZQwbB1OtX54AhYx12Q7rM1VdgfpYnklaUP2gTF0mGj3Z',  # INSERT YOUR REAL API KEY
+                'secret': 'H1GkoQm8HeIKCYZSVhbtkVn2DUmUKdHXBjqH5vUEwLXRmRnJ29CXoXnz66eFplNZ',  # INSERT YOUR REAL API SECRET
+                'options': {'defaultType': 'future'},
+                'proxies': proxies,
+                'enableRateLimit': True,
+                'session': session
+                # For testnet: uncomment below and use testnet keys
+                # 'urls': {'api': {'fapi': 'https://testnet.binancefuture.com/fapi'}},
+            })
+            exchange.load_markets()
+            logging.info(f"Successfully connected using proxy: {proxy['host']}:{proxy['port']}")
+            return exchange
+        except Exception as e:
+            logging.error(f"Failed to connect with proxy {proxy['host']}:{proxy['port']}: {e}")
+            continue
+    logging.error("All proxies failed. Falling back to direct connection.")
     try:
         exchange = ccxt.binance({
+            'apiKey': 'YOUR_API_KEY_HERE',  # INSERT YOUR REAL API KEY
+            'secret': 'YOUR_API_SECRET_HERE',  # INSERT YOUR REAL API SECRET
             'options': {'defaultType': 'future'},
             'enableRateLimit': True
+            # For testnet: uncomment below and use testnet keys
+            # 'urls': {'api': {'fapi': 'https://testnet.binancefuture.com/fapi'}},
         })
         exchange.load_markets()
         logging.info("Successfully connected using direct connection.")
         return exchange
     except Exception as e:
         logging.error(f"Direct connection failed: {e}")
-        raise Exception("Direct connection failed.")
+        raise Exception("All proxies and direct connection failed.")
 
 app = Flask(__name__)
 
@@ -144,6 +189,15 @@ try:
 except Exception as e:
     logging.error(f"Failed to initialize exchange: {e}")
     exit(1)
+
+# Set position mode to one-way (run once at startup)
+try:
+    exchange.fapiPrivate_post_positionside_dual({'dualSidePosition': False})
+    logging.info("Set position mode to one-way.")
+    send_telegram("Bot started: Position mode set to one-way.")
+except Exception as e:
+    logging.error(f"Failed to set position mode: {e}")
+    send_telegram(f"Error setting position mode: {e}")
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -208,38 +262,156 @@ def calculate_ema(candles, period=21):
         ema = (close - ema) * multiplier + ema
     return ema
 
-# === PRICE ROUNDING ===
+# === RSI ===
+def calculate_rsi(candles, period=14):
+    closes = np.array([c[4] for c in candles])
+    if len(closes) < period:
+        return None
+    return talib.RSI(closes, timeperiod=period)[-1]
+
+# === PRICE/QUANTITY ROUNDING ===
 def round_price(symbol, price):
     try:
         market = exchange.market(symbol)
-        tick_size = float(market['info']['filters'][0]['tickSize'])
-        precision = int(round(-math.log10(tick_size)))
-        return round(price, precision)
+        tick_size = float(market['precision']['price'])
+        return exchange.price_to_precision(symbol, price)
     except Exception as e:
         print(f"Error rounding price for {symbol}: {e}")
         return price
 
+def round_quantity(symbol, qty):
+    market = exchange.market(symbol)
+    step_size = float(market['precision']['amount'])
+    return exchange.amount_to_precision(symbol, qty)
+
+# === SET LEVERAGE ===
+def set_leverage(symbol):
+    try:
+        sym = symbol.replace('/', '')
+        exchange.fapiPrivate_post_leverage({'symbol': sym, 'leverage': LEVERAGE})
+        logging.info(f"Set leverage {LEVERAGE}x for {symbol}")
+        send_telegram(f"Step: Leverage set to {LEVERAGE}x for {symbol}")
+    except Exception as e:
+        logging.error(f"Failed to set leverage for {symbol}: {e}")
+        send_telegram(f"Error setting leverage for {symbol}: {e}")
+
+# === CALCULATE QUANTITY ===
+def calculate_quantity(symbol, entry_price):
+    notional = CAPITAL * LEVERAGE
+    qty = notional / entry_price
+    market = exchange.market(symbol)
+    min_qty = float(market['limits']['amount']['min'])
+    if qty < min_qty:
+        logging.warning(f"Qty {qty} < min {min_qty} for {symbol}. Skipping trade.")
+        send_telegram(f"Step: Skipping trade for {symbol} - Quantity {qty} below minimum {min_qty}")
+        return None
+    return round_quantity(symbol, qty)
+
+# === OPEN POSITION ===
+def open_position(symbol, side, entry_price, tp, sl, pattern):
+    send_telegram(f"Step: Attempting to open {side.upper()} position on {symbol} at approx {entry_price}")
+    try:
+        balance = exchange.fetch_balance()
+        free_usdt = balance.get('USDT', {}).get('free', 0)
+        required = CAPITAL * 1.1  # 10% buffer for fees
+        if free_usdt < required:
+            logging.warning(f"Insufficient balance for {symbol}: {free_usdt} < {required}")
+            send_telegram(f"Error: Insufficient balance for {symbol} - Available: {free_usdt} USDT, Required: {required} USDT")
+            return None, None
+        send_telegram(f"Step: Balance check passed for {symbol} - Available: {free_usdt} USDT")
+    except Exception as e:
+        logging.error(f"Balance check failed for {symbol}: {e}")
+        send_telegram(f"Error: Balance check failed for {symbol}: {e}")
+        return None, None
+
+    qty = calculate_quantity(symbol, entry_price)
+    if not qty:
+        return None, None
+
+    set_leverage(symbol)
+
+    try:
+        # Market order to open
+        order = exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side=side,
+            amount=qty,
+            params={'positionSide': 'BOTH'}  # One-way mode
+        )
+        actual_entry = float(order['average']) if 'average' in order else entry_price  # Get fill price
+        logging.info(f"Opened {side} position for {symbol} at {actual_entry}, qty: {qty}")
+        send_telegram(f"Step: Position opened for {symbol} - {side.upper()} at {actual_entry}, Quantity: {qty}")
+
+        # Place SL
+        close_side = 'sell' if side == 'buy' else 'buy'
+        sl_order = exchange.create_order(
+            symbol=symbol,
+            type='stop_market',
+            side=close_side,
+            amount=qty,
+            params={
+                'stopPrice': sl,
+                'reduceOnly': True,
+                'positionSide': 'BOTH'
+            }
+        )
+        logging.info(f"Placed SL at {sl} for {symbol}")
+        send_telegram(f"Step: SL placed at {sl} for {symbol}")
+
+        # Place TP
+        tp_order = exchange.create_order(
+            symbol=symbol,
+            type='take_profit_market',
+            side=close_side,
+            amount=qty,
+            params={
+                'stopPrice': tp,
+                'reduceOnly': True,
+                'positionSide': 'BOTH'
+            }
+        )
+        logging.info(f"Placed TP at {tp} for {symbol}")
+        send_telegram(f"Step: TP placed at {tp} for {symbol}")
+
+        return actual_entry, order['id']
+    except Exception as e:
+        logging.error(f"Failed to open position or place TP/SL for {symbol}: {e}")
+        send_telegram(f"Error: Failed to open position or place TP/SL for {symbol}: {e}")
+        return None, None
+
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    c2, c1 = candles[-3], candles[-2]
-    avg_volume = sum(c[5] for c in candles[-5:-1]) / 4
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
     big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     small_red_1 = (
         is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and
         c1[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    return big_green and small_red_1
+    small_red_0 = (
+        is_bearish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
+        lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT and
+        c0[4] > c2[3] + (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
+    )
+    volume_decreasing = c1[5] > c0[5]
+    return big_green and small_red_1 and small_red_0 and volume_decreasing
 
 def detect_falling_three(candles):
-    c2, c1 = candles[-3], candles[-2]
-    avg_volume = sum(c[5] for c in candles[-5:-1]) / 4
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
     big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
     small_green_1 = (
         is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and
         c1[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c1[5] < c2[5]
     )
-    return big_red and small_green_1
+    small_green_0 = (
+        is_bullish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and
+        c0[4] < c2[2] - (c2[2] - c2[3]) * 0.3 and c0[5] < c2[5]
+    )
+    volume_decreasing = c1[5] > c0[5]
+    return big_red and small_green_1 and small_green_0 and volume_decreasing
 
 # === SYMBOLS ===
 def get_symbols():
@@ -255,7 +427,7 @@ def get_next_candle_close():
         seconds_to_next += 15 * 60
     return time.time() + seconds_to_next
 
-# === TP/SL CHECK ===
+# === TP/SL CHECK (keep for logging/Telegram updates, exchange handles real close) ===
 def check_tp_sl():
     global closed_trades
     while True:
@@ -263,10 +435,37 @@ def check_tp_sl():
             with trade_lock:
                 for sym, trade in list(open_trades.items()):
                     try:
+                        # Check if position still open via API
+                        positions = exchange.fapiPrivate_get_positionrisk({'symbol': sym.replace('/', '')})
+                        position = next((p for p in positions if float(p['positionAmt']) != 0), None)
+                        if not position:
+                            # Closed by exchange
+                            hit = trade.get('hit', 'Closed')
+                            pnl_pct = float(position['unRealizedProfit']) / CAPITAL * 100 if position else 0
+                            profit = CAPITAL * pnl_pct / 100
+                            closed_trade = {
+                                'symbol': sym,
+                                'pnl': profit,
+                                'pnl_pct': pnl_pct,
+                                'category': trade['category'],
+                                'ema_status': trade['ema_status'],
+                                'pressure_status': trade['pressure_status'],
+                                'hit': hit,
+                                'body_pct': trade['body_pct']
+                            }
+                            closed_trades.append(closed_trade)
+                            save_closed_trades(closed_trade)
+                            new_msg = trade['msg'] + f"\nProfit/Loss: {pnl_pct:.2f}% (${profit:.2f})\n{hit}"
+                            edit_telegram_message(trade['msg_id'], new_msg)
+                            del open_trades[sym]
+                            save_trades()
+                            send_telegram(f"Step: Trade closed for {sym} - {hit}")
+                            continue
+
+                        # Sim check as before for precise hit detection
                         hit = ""
                         pnl = 0
                         hit_price = None
-
                         entry_time = trade.get('entry_time')
                         if entry_time:
                             candles_1m = exchange.fetch_ohlcv(sym, '1m', since=entry_time, limit=2880)
@@ -315,12 +514,13 @@ def check_tp_sl():
                                 pnl = (hit_price - trade['entry']) / trade['entry'] * 100
                             else:
                                 pnl = (trade['entry'] - hit_price) / trade['entry'] * 100
-                            logging.info(f"TP/SL hit for {sym}: {hit}, PnL: {pnl:.2f}%")
-                            profit = CAPITAL * pnl / 100
+                            leveraged_pnl_pct = pnl * LEVERAGE
+                            profit = CAPITAL * leveraged_pnl_pct / 100
+                            logging.info(f"TP/SL hit for {sym}: {hit}, Leveraged PnL: {leveraged_pnl_pct:.2f}%")
                             closed_trade = {
                                 'symbol': sym,
                                 'pnl': profit,
-                                'pnl_pct': pnl,
+                                'pnl_pct': leveraged_pnl_pct,
                                 'category': trade['category'],
                                 'ema_status': trade['ema_status'],
                                 'pressure_status': trade['pressure_status'],
@@ -338,7 +538,7 @@ def check_tp_sl():
                                 f"entry - {trade['entry']}\n"
                                 f"tp - {trade['tp']}\n"
                                 f"sl - {trade['sl']}\n"
-                                f"Profit/Loss: {pnl:.2f}% (${profit:.2f})\n{hit}"
+                                f"Profit/Loss: {leveraged_pnl_pct:.2f}% (${profit:.2f})\n{hit}"
                             )
                             trade['msg'] = new_msg
                             trade['hit'] = hit
@@ -347,43 +547,54 @@ def check_tp_sl():
                             del open_trades[sym]
                             save_trades()
                             logging.info(f"Trade closed for {sym}")
+                            send_telegram(f"Step: Trade closed for {sym} - {hit}")
                     except Exception as e:
                         logging.error(f"TP/SL check error on {sym}: {e}")
+                        send_telegram(f"Error in TP/SL check for {sym}: {e}")
             time.sleep(TP_SL_CHECK_INTERVAL)
         except Exception as e:
             logging.error(f"TP/SL loop error: {e}")
+            send_telegram(f"Error in TP/SL loop: {e}")
             time.sleep(5)
 
 # === PROCESS SYMBOL ===
 def process_symbol(symbol, alert_queue):
+    send_telegram(f"Step: Processing symbol {symbol}")
     try:
         for attempt in range(3):
             try:
                 candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
                 if len(candles) < 25:
+                    send_telegram(f"Step: Insufficient candles for {symbol} - skipping")
                     return
                 if attempt < 2 and candles[-1][0] > candles[-2][0]:
                     break
                 time.sleep(0.5)
             except ccxt.NetworkError as e:
                 print(f"Network error on {symbol}: {e}")
+                send_telegram(f"Error: Network error fetching candles for {symbol}: {e}")
                 time.sleep(2 ** attempt)
                 continue
 
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
-        if ema21 is None or ema9 is None:
+        rsi = calculate_rsi(candles, period=RSI_PERIOD)
+        if ema21 is None or ema9 is None or rsi is None:
+            send_telegram(f"Step: EMA/RSI calculation failed for {symbol} - skipping")
             return
 
         signal_time = candles[-2][0]
-        first_small_candle_close = round_price(symbol, candles[-2][4])
-        big_candle_close = round_price(symbol, candles[-3][4])
+        first_small_candle_close = round_price(symbol, candles[-3][4])
+        second_small_candle_close = round_price(symbol, candles[-2][4])
+        big_candle_close = round_price(symbol, candles[-4][4])
 
         if detect_rising_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-2], 'rising')
+            first_candle_analysis = analyze_first_small_candle(candles[-3], 'rising')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
-                return  # Skip non-reversed trades silently
+                send_telegram(f"Step: Body size threshold exceeded for {symbol} rising - skipping")
+                return
             if sent_signals.get((symbol, 'rising')) == signal_time:
+                send_telegram(f"Step: Signal already sent for {symbol} rising - skipping")
                 return
             sent_signals[(symbol, 'rising')] = signal_time
             price_above_ema21 = first_small_candle_close > ema21
@@ -396,33 +607,37 @@ def process_symbol(symbol, alert_queue):
             if green_count == 2:
                 category = 'two_green'
             elif green_count == 1:
-                category = 'one_green_one_caution'
-            elif green_count == 0:
-                category = 'two_cautions'
+                category = 'one_green'
             else:
-                return
+                category = 'two_cautions'
             side = 'sell'
-            entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 - TP_PCT))
+            entry_price = second_small_candle_close
+            tp = round_price(symbol, first_small_candle_close * (1 - TP_PCT))
             sl = round_price(symbol, entry_price * (1 + SL_PCT))
+            tp_distance = (entry_price - tp) / entry_price * 100
             pattern = 'rising'
             msg = (
-                f"{symbol} - REVERSED SELL PATTERN\n"
+                f"{symbol} - {'REVERSED SELL' if side == 'sell' else 'RISING'} PATTERN\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
+                f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
                 f"entry - {entry_price}\n"
                 f"tp - {tp}\n"
+                f"TP Distance: {tp_distance:.2f}%\n"
                 f"sl - {sl}\n"
                 f"Trade going on..."
             )
             alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
+            send_telegram(f"Step: Rising pattern detected for {symbol} - added to queue")
 
         elif detect_falling_three(candles):
-            first_candle_analysis = analyze_first_small_candle(candles[-2], 'falling')
+            first_candle_analysis = analyze_first_small_candle(candles[-3], 'falling')
             if first_candle_analysis['body_pct'] > BODY_SIZE_THRESHOLD:
-                return  # Skip non-reversed trades silently
+                send_telegram(f"Step: Body size threshold exceeded for {symbol} falling - skipping")
+                return
             if sent_signals.get((symbol, 'falling')) == signal_time:
+                send_telegram(f"Step: Signal already sent for {symbol} falling - skipping")
                 return
             sent_signals[(symbol, 'falling')] = signal_time
             price_below_ema21 = first_small_candle_close < ema21
@@ -435,32 +650,36 @@ def process_symbol(symbol, alert_queue):
             if green_count == 2:
                 category = 'two_green'
             elif green_count == 1:
-                category = 'one_green_one_caution'
-            elif green_count == 0:
-                category = 'two_cautions'
+                category = 'one_green'
             else:
-                return
+                category = 'two_cautions'
             side = 'buy'
-            entry_price = first_small_candle_close
-            tp = round_price(symbol, entry_price * (1 + TP_PCT))
+            entry_price = second_small_candle_close
+            tp = round_price(symbol, first_small_candle_close * (1 + TP_PCT))
             sl = round_price(symbol, entry_price * (1 - SL_PCT))
+            tp_distance = (tp - entry_price) / entry_price * 100
             pattern = 'falling'
             msg = (
-                f"{symbol} - REVERSED BUY PATTERN\n"
+                f"{symbol} - {'REVERSED BUY' if side == 'buy' else 'FALLING'} PATTERN\n"
                 f"Below 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 below 21 - {ema_status['ema9_ema21']}\n"
+                f"RSI: {rsi:.2f}\n"
                 f"First small candle: {first_candle_analysis['text']}\n"
                 f"entry - {entry_price}\n"
                 f"tp - {tp}\n"
+                f"TP Distance: {tp_distance:.2f}%\n"
                 f"sl - {sl}\n"
                 f"Trade going on..."
             )
             alert_queue.put((symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis['text'], first_candle_analysis['status'], first_candle_analysis['body_pct'], pattern))
+            send_telegram(f"Step: Falling pattern detected for {symbol} - added to queue")
 
     except ccxt.RateLimitExceeded:
         time.sleep(5)
+        send_telegram(f"Error: Rate limit exceeded for {symbol} - retrying after delay")
     except Exception as e:
         logging.error(f"Error on {symbol}: {e}")
+        send_telegram(f"Error processing {symbol}: {e}")
 
 # === PROCESS BATCH ===
 def process_batch(symbols, alert_queue):
@@ -475,6 +694,7 @@ def scan_loop():
     load_trades()
     symbols = get_symbols()
     print(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
+    send_telegram(f"Step: Starting scan of {len(symbols)} symbols")
     alert_queue = queue.Queue()
 
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
@@ -484,29 +704,13 @@ def scan_loop():
         while True:
             try:
                 symbol, msg, ema_status, category, side, entry_price, tp, sl, first_candle_analysis, pressure_status, body_pct, pattern = alert_queue.get(timeout=1)
+                send_telegram(f"Step: Processing alert for {symbol}")
                 with trade_lock:
-                    if len(open_trades) < MAX_OPEN_TRADES:
-                        mid = send_telegram(msg)
-                        if mid and symbol not in open_trades:
-                            trade = {
-                                'side': side,
-                                'entry': entry_price,
-                                'tp': tp,
-                                'sl': sl,
-                                'msg': msg,
-                                'msg_id': mid,
-                                'ema_status': ema_status,
-                                'category': category,
-                                'first_candle_analysis': first_candle_analysis,
-                                'pressure_status': pressure_status,
-                                'body_pct': body_pct,
-                                'entry_time': int(time.time() * 1000),
-                                'pattern': pattern
-                            }
-                            open_trades[symbol] = trade
-                            save_trades()
-                            logging.info(f"New trade opened for {symbol}")
-                    else:
+                    # Check current open positions count via API
+                    positions = exchange.fapiPrivate_get_positionrisk()
+                    open_count = sum(1 for p in positions if float(p['positionAmt']) != 0)
+                    if open_count >= MAX_OPEN_TRADES:
+                        send_telegram(f"Step: Max open trades reached ({open_count}/{MAX_OPEN_TRADES}) - checking for replacement")
                         lowest_priority = min(
                             (CATEGORY_PRIORITY[trade['category']] for trade in open_trades.values()),
                             default=0
@@ -514,44 +718,52 @@ def scan_loop():
                         if CATEGORY_PRIORITY[category] > lowest_priority:
                             for sym, trade in list(open_trades.items()):
                                 if CATEGORY_PRIORITY[trade['category']] == lowest_priority:
+                                    send_telegram(f"Step: Closing {sym} for higher-priority signal ({symbol})")
+                                    # Close lowest priority trade
+                                    close_side = 'sell' if trade['side'] == 'buy' else 'buy'
+                                    qty = abs(float(exchange.fapiPrivate_get_positionrisk({'symbol': sym.replace('/', '')})[0]['positionAmt']))
+                                    exchange.create_order(sym, 'market', close_side, qty, params={'reduceOnly': True, 'positionSide': 'BOTH'})
                                     edit_telegram_message(
                                         trade['msg_id'],
-                                        f"{sym} - Trade canceled for higher-priority signal."
+                                        f"{sym} - Trade closed for higher-priority signal."
                                     )
                                     del open_trades[sym]
                                     save_trades()
-                                    mid = send_telegram(msg)
-                                    if mid and symbol not in open_trades:
-                                        trade = {
-                                            'side': side,
-                                            'entry': entry_price,
-                                            'tp': tp,
-                                            'sl': sl,
-                                            'msg': msg,
-                                            'msg_id': mid,
-                                            'ema_status': ema_status,
-                                            'category': category,
-                                            'first_candle_analysis': first_candle_analysis,
-                                            'pressure_status': pressure_status,
-                                            'body_pct': body_pct,
-                                            'entry_time': int(time.time() * 1000),
-                                            'pattern': pattern
-                                        }
-                                        open_trades[symbol] = trade
-                                        save_trades()
-                                        logging.info(f"Replaced trade with higher priority for {symbol}")
+                                    send_telegram(f"Step: Closed {sym} successfully")
                                     break
-                    alert_queue.task_done()
+
+                    # Open new trade
+                    actual_entry, order_id = open_position(symbol, side, entry_price, tp, sl, pattern)
+                    if actual_entry:
+                        updated_msg = msg.replace(str(entry_price), str(actual_entry))  # Update with actual entry
+                        mid = send_telegram(updated_msg)
+                        trade = {
+                            'side': side,
+                            'entry': actual_entry,
+                            'tp': tp,
+                            'sl': sl,
+                            'msg': updated_msg,
+                            'msg_id': mid,
+                            'ema_status': ema_status,
+                            'category': category,
+                            'first_candle_analysis': first_candle_analysis,
+                            'pressure_status': pressure_status,
+                            'body_pct': body_pct,
+                            'entry_time': int(time.time() * 1000),
+                            'pattern': pattern,
+                            'order_id': order_id
+                        }
+                        open_trades[symbol] = trade
+                        save_trades()
+                        logging.info(f"New trade opened for {symbol}")
+                        send_telegram(f"Step: New trade opened and saved for {symbol}")
+                alert_queue.task_done()
             except queue.Empty:
-                with trade_lock:
-                    for sym, trade in list(open_trades.items()):
-                        if 'hit' in trade:
-                            edit_telegram_message(trade['msg_id'], trade['msg'])
-                            logging.info(f"Safety net update for {sym}: {trade['hit']}")
                 time.sleep(1)
                 continue
             except Exception as e:
                 logging.error(f"Alert thread error: {e}")
+                send_telegram(f"Error in alert processing: {e}")
                 time.sleep(1)
 
     threading.Thread(target=send_alerts, daemon=True).start()
@@ -561,10 +773,12 @@ def scan_loop():
         next_close = get_next_candle_close()
         wait_time = max(0, next_close - time.time())
         print(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
+        send_telegram(f"Step: Waiting {wait_time:.1f}s for next candle close")
         time.sleep(wait_time)
 
         for i, chunk in enumerate(symbol_chunks):
             print(f"Processing batch {i+1}/{NUM_CHUNKS}...")
+            send_telegram(f"Step: Processing batch {i+1}/{NUM_CHUNKS}")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
@@ -572,12 +786,14 @@ def scan_loop():
         print("✅ Scan complete.")
         num_open = len(open_trades)
         print(f"📊 Number of open trades: {num_open}")
+        send_telegram(f"Step: Scan complete - Open trades: {num_open}")
 
         current_time = time.time()
         if current_time - last_summary_time >= SUMMARY_INTERVAL:
+            send_telegram("Step: Generating hourly summary")
             all_closed_trades = load_closed_trades()
             two_green_trades = [t for t in all_closed_trades if t['category'] == 'two_green']
-            one_green_one_caution_trades = [t for t in all_closed_trades if t['category'] == 'one_green_one_caution']
+            one_green_trades = [t for t in all_closed_trades if t['category'] == 'one_green']
             two_cautions_trades = [t for t in all_closed_trades if t['category'] == 'two_cautions']
 
             def get_pressure_metrics(trades):
@@ -615,7 +831,7 @@ def scan_loop():
                 }
 
             two_green_metrics = get_pressure_metrics(two_green_trades)
-            one_green_one_caution_metrics = get_pressure_metrics(one_green_one_caution_trades)
+            one_green_metrics = get_pressure_metrics(one_green_trades)
             two_cautions_metrics = get_pressure_metrics(two_cautions_trades)
 
             total_pnl = sum(t.get('pnl', 0) for t in all_closed_trades)
@@ -645,11 +861,11 @@ def scan_loop():
                 f"  - Total: {two_green_metrics['small_body']['total'][0]} trades (W: {two_green_metrics['small_body']['total'][1]}, L: {two_green_metrics['small_body']['total'][2]}, TP: {two_green_metrics['small_body']['total'][3]}, SL: {two_green_metrics['small_body']['total'][4]}), PnL: ${two_green_metrics['small_body']['total'][5]:.2f} ({two_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {two_green_metrics['small_body']['total'][7]:.2f}%\n"
                 f"  - Overall Total: {two_green_metrics['total'][0]} trades (W: {two_green_metrics['total'][1]}, L: {two_green_metrics['total'][2]}, TP: {two_green_metrics['total'][3]}, SL: {two_green_metrics['total'][4]}), PnL: ${two_green_metrics['total'][5]:.2f} ({two_green_metrics['total'][6]:.2f}%), Win Rate: {two_green_metrics['total'][7]:.2f}%\n"
                 f"- ✅⚠️ One Green One Caution:\n"
-                f"  - Neutral ✅: {one_green_one_caution_metrics['small_body']['neutral'][0]} trades (W: {one_green_one_caution_metrics['small_body']['neutral'][1]}, L: {one_green_one_caution_metrics['small_body']['neutral'][2]}, TP: {one_green_one_caution_metrics['small_body']['neutral'][3]}, SL: {one_green_one_caution_metrics['small_body']['neutral'][4]}), PnL: ${one_green_one_caution_metrics['small_body']['neutral'][5]:.2f} ({one_green_one_caution_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {one_green_one_caution_metrics['small_body']['neutral'][7]:.2f}%\n"
-                f"  - Selling Pressure ⚠️: {one_green_one_caution_metrics['small_body']['selling'][0]} trades (W: {one_green_one_caution_metrics['small_body']['selling'][1]}, L: {one_green_one_caution_metrics['small_body']['selling'][2]}, TP: {one_green_one_caution_metrics['small_body']['selling'][3]}, SL: {one_green_one_caution_metrics['small_body']['selling'][4]}), PnL: ${one_green_one_caution_metrics['small_body']['selling'][5]:.2f} ({one_green_one_caution_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {one_green_one_caution_metrics['small_body']['selling'][7]:.2f}%\n"
-                f"  - Buying Pressure ⚠️: {one_green_one_caution_metrics['small_body']['buying'][0]} trades (W: {one_green_one_caution_metrics['small_body']['buying'][1]}, L: {one_green_one_caution_metrics['small_body']['buying'][2]}, TP: {one_green_one_caution_metrics['small_body']['buying'][3]}, SL: {one_green_one_caution_metrics['small_body']['buying'][4]}), PnL: ${one_green_one_caution_metrics['small_body']['buying'][5]:.2f} ({one_green_one_caution_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {one_green_one_caution_metrics['small_body']['buying'][7]:.2f}%\n"
-                f"  - Total: {one_green_one_caution_metrics['small_body']['total'][0]} trades (W: {one_green_one_caution_metrics['small_body']['total'][1]}, L: {one_green_one_caution_metrics['small_body']['total'][2]}, TP: {one_green_one_caution_metrics['small_body']['total'][3]}, SL: {one_green_one_caution_metrics['small_body']['total'][4]}), PnL: ${one_green_one_caution_metrics['small_body']['total'][5]:.2f} ({one_green_one_caution_metrics['small_body']['total'][6]:.2f}%), Win Rate: {one_green_one_caution_metrics['small_body']['total'][7]:.2f}%\n"
-                f"  - Overall Total: {one_green_one_caution_metrics['total'][0]} trades (W: {one_green_one_caution_metrics['total'][1]}, L: {one_green_one_caution_metrics['total'][2]}, TP: {one_green_one_caution_metrics['total'][3]}, SL: {one_green_one_caution_metrics['total'][4]}), PnL: ${one_green_one_caution_metrics['total'][5]:.2f} ({one_green_one_caution_metrics['total'][6]:.2f}%), Win Rate: {one_green_one_caution_metrics['total'][7]:.2f}%\n"
+                f"  - Neutral ✅: {one_green_metrics['small_body']['neutral'][0]} trades (W: {one_green_metrics['small_body']['neutral'][1]}, L: {one_green_metrics['small_body']['neutral'][2]}, TP: {one_green_metrics['small_body']['neutral'][3]}, SL: {one_green_metrics['small_body']['neutral'][4]}), PnL: ${one_green_metrics['small_body']['neutral'][5]:.2f} ({one_green_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['neutral'][7]:.2f}%\n"
+                f"  - Selling Pressure ⚠️: {one_green_metrics['small_body']['selling'][0]} trades (W: {one_green_metrics['small_body']['selling'][1]}, L: {one_green_metrics['small_body']['selling'][2]}, TP: {one_green_metrics['small_body']['selling'][3]}, SL: {one_green_metrics['small_body']['selling'][4]}), PnL: ${one_green_metrics['small_body']['selling'][5]:.2f} ({one_green_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['selling'][7]:.2f}%\n"
+                f"  - Buying Pressure ⚠️: {one_green_metrics['small_body']['buying'][0]} trades (W: {one_green_metrics['small_body']['buying'][1]}, L: {one_green_metrics['small_body']['buying'][2]}, TP: {one_green_metrics['small_body']['buying'][3]}, SL: {one_green_metrics['small_body']['buying'][4]}), PnL: ${one_green_metrics['small_body']['buying'][5]:.2f} ({one_green_metrics['small_body']['buying'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['buying'][7]:.2f}%\n"
+                f"  - Total: {one_green_metrics['small_body']['total'][0]} trades (W: {one_green_metrics['small_body']['total'][1]}, L: {one_green_metrics['small_body']['total'][2]}, TP: {one_green_metrics['small_body']['total'][3]}, SL: {one_green_metrics['small_body']['total'][4]}), PnL: ${one_green_metrics['small_body']['total'][5]:.2f} ({one_green_metrics['small_body']['total'][6]:.2f}%), Win Rate: {one_green_metrics['small_body']['total'][7]:.2f}%\n"
+                f"  - Overall Total: {one_green_metrics['total'][0]} trades (W: {one_green_metrics['total'][1]}, L: {one_green_metrics['total'][2]}, TP: {one_green_metrics['total'][3]}, SL: {one_green_metrics['total'][4]}), PnL: ${one_green_metrics['total'][5]:.2f} ({one_green_metrics['total'][6]:.2f}%), Win Rate: {one_green_metrics['total'][7]:.2f}%\n"
                 f"- ⚠️⚠️ Two Cautions:\n"
                 f"  - Neutral ✅: {two_cautions_metrics['small_body']['neutral'][0]} trades (W: {two_cautions_metrics['small_body']['neutral'][1]}, L: {two_cautions_metrics['small_body']['neutral'][2]}, TP: {two_cautions_metrics['small_body']['neutral'][3]}, SL: {two_cautions_metrics['small_body']['neutral'][4]}), PnL: ${two_cautions_metrics['small_body']['neutral'][5]:.2f} ({two_cautions_metrics['small_body']['neutral'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['neutral'][7]:.2f}%\n"
                 f"  - Selling Pressure ⚠️: {two_cautions_metrics['small_body']['selling'][0]} trades (W: {two_cautions_metrics['small_body']['selling'][1]}, L: {two_cautions_metrics['small_body']['selling'][2]}, TP: {two_cautions_metrics['small_body']['selling'][3]}, SL: {two_cautions_metrics['small_body']['selling'][4]}), PnL: ${two_cautions_metrics['small_body']['selling'][5]:.2f} ({two_cautions_metrics['small_body']['selling'][6]:.2f}%), Win Rate: {two_cautions_metrics['small_body']['selling'][7]:.2f}%\n"
@@ -665,6 +881,7 @@ def scan_loop():
             send_telegram(f"Number of open trades after scan: {num_open}")
             last_summary_time = current_time
             closed_trades = []
+            send_telegram("Step: Hourly summary sent")
 
 # === FLASK ===
 @app.route('/')

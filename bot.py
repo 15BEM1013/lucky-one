@@ -3,19 +3,25 @@ import time
 import threading
 import requests
 from flask import Flask
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import math
 import queue
-import numpy as np
+import os
 import logging
 from datetime import datetime
 import pytz
 
 app = Flask(__name__)
 
-# === CONFIG ===
-BOT_TOKEN = '7402265241:AAHRDxd12LRizl1qTsQggEEoJ-BeWME3ERo'
-CHAT_ID = '655537138'
+# === CONFIG (ALL SECRETS FROM ENVIRONMENT VARIABLES) ===
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
+API_KEY = os.getenv('API_KEY')
+API_SECRET = os.getenv('API_SECRET')
+
+if not all([BOT_TOKEN, CHAT_ID, API_KEY, API_SECRET]):
+    raise ValueError("Missing required environment variables! Check Render settings.")
+
 TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 1.0
@@ -23,10 +29,10 @@ MIN_LOWER_WICK_PCT = 20.0
 MAX_WORKERS = 5
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
-CAPITAL = 8.0
+CAPITAL = 8.0          # USDT base capital per trade
 LEVERAGE = 5
-SL_PCT = 0.03
-TP_PCT = 0.01
+SL_PCT = 0.03         # 3%
+TP_PCT = 0.01         # 1%
 MAX_OPEN_TRADES = 5
 BODY_SIZE_THRESHOLD = 0.1
 
@@ -41,25 +47,26 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {'chat_id': CHAT_ID, 'text': msg}
     try:
-        requests.post(url, data=data, timeout=5).json()
-        print(f"Telegram: {msg}")
+        requests.post(url, data=data, timeout=5)
+        print(f"Telegram sent: {msg}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# === INIT EXCHANGE ===
+# === EXCHANGE ===
 def initialize_exchange():
     exchange = ccxt.binance({
-        'apiKey': '92h8f69jYEzd0sFaHxaVGI2EBk4GH7lYau6oPtb9MAIoZmdA2L8sFiycQxvEW8xX',
-        'secret': 's0lCo1RjuyLPAJciQnhUO8WTsC3SHXjeDuxEC4X31fNgybixwe9S2HNSt5akezDd',
+        'apiKey': API_KEY,
+        'secret': API_SECRET,
         'options': {'defaultType': 'future'},
         'enableRateLimit': True,
     })
     exchange.load_markets()
     try:
-        exchange.fapiPrivate_post_positionside_dual({'dualSidePosition': False})
-        send_telegram("Bot started - One-way mode set")
+        # One-way mode (as in your code)
+        exchange.fapiPrivate_post_positionside_dual({'dualSidePosition': 'false'})
+        send_telegram("✅ Bot started - One-way mode set")
     except Exception as e:
-        send_telegram(f"Position mode error: {e}")
+        send_telegram(f"Position mode warning: {e}")
     return exchange
 
 exchange = initialize_exchange()
@@ -84,11 +91,10 @@ def calculate_ema(candles, period=21):
 
 def round_price(symbol, price):
     return exchange.price_to_precision(symbol, price)
-
 def round_quantity(symbol, qty):
     return exchange.amount_to_precision(symbol, qty)
 
-# === FIRST SMALL CANDLE ANALYSIS (FULLY RESTORED) ===
+# === FIRST SMALL CANDLE ANALYSIS ===
 def analyze_first_small_candle(candle, pattern_type):
     body = body_pct(candle)
     upper_wick = (candle[2] - max(candle[1], candle[4])) / candle[1] * 100
@@ -98,32 +104,18 @@ def analyze_first_small_candle(candle, pattern_type):
 
     if pattern_type == 'rising':
         if wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
-        elif wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
-        elif body >= 0.1:
-            if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
-            elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
-            else:
-                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
+            return {'text': f"Selling pressure ⚠️\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'selling_pressure'}
+        elif wick_ratio_reverse >= 2.5:
+            return {'text': f"Buying pressure ⚠️\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'buying_pressure'}
         else:
-            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
-    elif pattern_type == 'falling':
+            return {'text': f"Neutral ✅\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'neutral'}
+    else:  # falling
         if wick_ratio_reverse >= 2.5 and body < 0.1:
-            return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
-        elif wick_ratio >= 2.5 and body < 0.1:
-            return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
-        elif body >= 0.1:
-            if wick_ratio_reverse >= 2.5:
-                return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
-            elif wick_ratio >= 2.5:
-                return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
-            else:
-                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
+            return {'text': f"Buying pressure ⚠️\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'buying_pressure'}
+        elif wick_ratio >= 2.5:
+            return {'text': f"Selling pressure ⚠️\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'selling_pressure'}
         else:
-            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
+            return {'text': f"Neutral ✅\nUpper: {upper_wick:.1f}%\nLower: {lower_wick:.1f}%\nBody: {body:.1f}%", 'status': 'neutral'}
 
 # === LEVERAGE & QUANTITY ===
 def set_leverage(symbol):
@@ -137,46 +129,48 @@ def calculate_quantity(symbol, entry_price):
     notional = CAPITAL * LEVERAGE
     qty = notional / entry_price
     market = exchange.market(symbol)
-    min_qty = float(market['limits']['amount']['min'])
-    if qty < min_qty:
-        send_telegram(f"Skip {symbol}: Qty {qty:.6f} < min {min_qty}")
+    min_qty = float(market['limits']['amount']['min'] or 0)
+    min_notional = float(market['limits']['cost']['min'] or 0)
+    if qty < min_qty or (qty * entry_price) < min_notional:
+        send_telegram(f"Skip {symbol}: Qty {qty:.6f} too small (min {min_qty})")
         return None
     return round_quantity(symbol, qty)
 
-# === OPEN POSITION WITH TP/SL ===
+# === OPEN POSITION ===
 def open_position(symbol, side, entry_price, tp_price, sl_price, analysis_text):
-    send_telegram(f"Executing {side.upper()} on {symbol}\nFirst small candle:\n{analysis_text}\nEntry ~{entry_price}")
-
+    send_telegram(f"🚀 Executing {side.upper()} {symbol}\nFirst candle analysis:\n{analysis_text}\nEntry ≈ {entry_price:.4f}")
+    
     try:
         balance = exchange.fetch_balance()['USDT']['free']
-        if balance < CAPITAL * 1.1:
-            send_telegram(f"Insufficient balance: {balance:.2f} USDT")
+        if balance < CAPITAL * 1.2:
+            send_telegram(f"⚠️ Low balance: {balance:.2f} USDT")
             return
     except Exception as e:
-        send_telegram(f"Balance check error: {e}")
+        send_telegram(f"Balance error: {e}")
         return
 
     qty = calculate_quantity(symbol, entry_price)
-    if not qty: return
+    if not qty:
+        return
 
     set_leverage(symbol)
 
     try:
-        order = exchange.create_order(symbol, 'market', side, qty, params={'positionSide': 'BOTH'})
+        # Market entry
+        order = exchange.create_order(symbol, 'market', side, qty)
         actual_entry = float(order.get('average') or order.get('price') or entry_price)
-        send_telegram(f"Opened {side.upper()} {symbol} at {actual_entry} (Qty: {qty})")
+        send_telegram(f"✅ Opened {side.upper()} {symbol} at {actual_entry:.4f} (Qty: {qty})")
 
+        # SL & TP
         close_side = 'sell' if side == 'buy' else 'buy'
         exchange.create_order(symbol, 'stop_market', close_side, qty,
-                              params={'stopPrice': sl_price, 'reduceOnly': True, 'positionSide': 'BOTH'})
-        send_telegram(f"SL placed at {sl_price}")
-
+                              params={'stopPrice': sl_price, 'reduceOnly': True})
+        send_telegram(f"🛑 SL set at {sl_price:.4f}")
         exchange.create_order(symbol, 'take_profit_market', close_side, qty,
-                              params={'stopPrice': tp_price, 'reduceOnly': True, 'positionSide': 'BOTH'})
-        send_telegram(f"TP placed at {tp_price}")
-
+                              params={'stopPrice': tp_price, 'reduceOnly': True})
+        send_telegram(f"🎯 TP set at {tp_price:.4f}")
     except Exception as e:
-        send_telegram(f"Order error {symbol}: {e}")
+        send_telegram(f"❌ Order failed {symbol}: {str(e)}")
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
@@ -212,8 +206,8 @@ def process_symbol(symbol, alert_queue):
         second_close = candles[-2][4]
 
         if detect_rising_three(candles):
-            analysis = analyze_first_small_candle(candles[-3], 'rising')
             if body_pct(candles[-3]) > BODY_SIZE_THRESHOLD: return
+            analysis = analyze_first_small_candle(candles[-3], 'rising')
             if sent_signals.get((symbol, 'rising')) == signal_time: return
             sent_signals[(symbol, 'rising')] = signal_time
 
@@ -225,8 +219,8 @@ def process_symbol(symbol, alert_queue):
                 alert_queue.put((symbol, side, entry, tp, sl, analysis['text']))
 
         elif detect_falling_three(candles):
-            analysis = analyze_first_small_candle(candles[-3], 'falling')
             if body_pct(candles[-3]) > BODY_SIZE_THRESHOLD: return
+            analysis = analyze_first_small_candle(candles[-3], 'falling')
             if sent_signals.get((symbol, 'falling')) == signal_time: return
             sent_signals[(symbol, 'falling')] = signal_time
 
@@ -236,13 +230,14 @@ def process_symbol(symbol, alert_queue):
                 tp = round_price(symbol, first_close * (1 + TP_PCT))
                 sl = round_price(symbol, entry * (1 - SL_PCT))
                 alert_queue.put((symbol, side, entry, tp, sl, analysis['text']))
+
     except Exception as e:
-        send_telegram(f"Error {symbol}: {e}")
+        send_telegram(f"Error processing {symbol}: {e}")
 
 # === SCAN LOOP ===
 def scan_loop():
-    send_telegram("Bot started - Scanning began")
-    symbols = [s for s in exchange.load_markets() if 'USDT' in s and exchange.markets[s]['contract'] and exchange.markets[s]['active']]
+    send_telegram("🤖 Auto-Trading Bot Started (LIVE)")
+    symbols = [s for s in exchange.markets if 'USDT' in s and exchange.markets[s]['contract'] and exchange.markets[s]['active']]
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
     symbol_chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
 
@@ -262,36 +257,36 @@ def scan_loop():
                     positions = exchange.fapiPrivate_get_positionrisk()
                     open_count = sum(1 for p in positions if float(p['positionAmt']) != 0)
                     if open_count >= MAX_OPEN_TRADES:
-                        send_telegram(f"Max trades reached ({open_count}) - skipping {symbol}")
+                        send_telegram(f"⚠️ Max {MAX_OPEN_TRADES} trades open - skipping {symbol}")
                         continue
                     open_position(symbol, side, entry, tp, sl, analysis_text)
             except queue.Empty:
-                time.sleep(1)
+                time.sleep(0.5)
             except Exception as e:
-                send_telegram(f"Alert error: {e}")
+                send_telegram(f"Alert processing error: {e}")
 
     threading.Thread(target=process_alerts, daemon=True).start()
 
     while True:
         wait_time = max(0, get_next_close() - time.time())
-        send_telegram(f"Waiting {wait_time:.0f}s for next 15m candle")
+        send_telegram(f"⏳ Waiting {int(wait_time)}s for next candle...")
         time.sleep(wait_time)
 
         for i, chunk in enumerate(symbol_chunks):
-            send_telegram(f"Scanning batch {i+1}/{NUM_CHUNKS}")
+            send_telegram(f"🔍 Scanning batch {i+1}/{NUM_CHUNKS} ({len(chunk)} symbols)")
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                for symbol in chunk:
-                    executor.submit(process_symbol, symbol, alert_queue)
+                for sym in chunk:
+                    executor.submit(process_symbol, sym, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
 
-        send_telegram("Scan complete")
+        send_telegram("✅ Scan cycle complete")
 
-# === FLASK (KEEP ALIVE) ===
+# === FLASK KEEP-ALIVE ===
 @app.route('/')
 def home():
-    return "✅ Rising & Falling Three Pattern Bot is Live!"
+    return "✅ Rising & Falling Three Auto-Trading Bot is Live! (Real Money)"
 
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=8080)
+    # Gunicorn will be used in Render (do not use app.run here)

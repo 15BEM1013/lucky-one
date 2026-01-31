@@ -1,5 +1,10 @@
 gunicorn
 ccxt>=4.4.92
+ccxt==4.3.0
+flask==3.0.0
+requests==2.31.0
+gunicorn==22.0.0
+pytz==2024.1
 requests
 flask
 python-dateutil

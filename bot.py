@@ -88,7 +88,7 @@ def round_price(symbol, price):
 def round_quantity(symbol, qty):
     return exchange.amount_to_precision(symbol, qty)
 
-# === FIRST SMALL CANDLE ANALYSIS (RESTORED) ===
+# === FIRST SMALL CANDLE ANALYSIS (FULLY RESTORED) ===
 def analyze_first_small_candle(candle, pattern_type):
     body = body_pct(candle)
     upper_wick = (candle[2] - max(candle[1], candle[4])) / candle[1] * 100
@@ -110,8 +110,20 @@ def analyze_first_small_candle(candle, pattern_type):
                 return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
         else:
             return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
-    else:  # falling
-        similar logic...
+    elif pattern_type == 'falling':
+        if wick_ratio_reverse >= 2.5 and body < 0.1:
+            return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
+        elif wick_ratio >= 2.5 and body < 0.1:
+            return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
+        elif body >= 0.1:
+            if wick_ratio_reverse >= 2.5:
+                return {'text': f"Buying pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'buying_pressure'}
+            elif wick_ratio >= 2.5:
+                return {'text': f"Selling pressure ⚠️\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'selling_pressure'}
+            else:
+                return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
+        else:
+            return {'text': f"Neutral ✅\nUpper wick: {upper_wick:.2f}%\nLower wick: {lower_wick:.2f}%\nBody: {body:.2f}%", 'status': 'neutral'}
 
 # === LEVERAGE & QUANTITY ===
 def set_leverage(symbol):
@@ -133,7 +145,7 @@ def calculate_quantity(symbol, entry_price):
 
 # === OPEN POSITION WITH TP/SL ===
 def open_position(symbol, side, entry_price, tp_price, sl_price, analysis_text):
-    send_telegram(f"Executing {side.upper()} on {symbol}\nFirst small candle: {analysis_text}\nEntry ~{entry_price}")
+    send_telegram(f"Executing {side.upper()} on {symbol}\nFirst small candle:\n{analysis_text}\nEntry ~{entry_price}")
 
     try:
         balance = exchange.fetch_balance()['USDT']['free']
@@ -166,39 +178,116 @@ def open_position(symbol, side, entry_price, tp_price, sl_price, analysis_text):
     except Exception as e:
         send_telegram(f"Order error {symbol}: {e}")
 
-# === PATTERN DETECTION (with restored analysis) ===
+# === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    # ... same as before ...
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_red_1 = is_bearish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT and c1[5] < c2[5]
+    small_red_0 = is_bearish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT and c0[5] < c2[5]
+    return big_green and small_red_1 and small_red_0
 
 def detect_falling_three(candles):
-    # ... same as before ...
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    avg_volume = sum(c[5] for c in candles[-6:-1]) / 5
+    big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_volume
+    small_green_1 = is_bullish(c1) and body_pct(c1) <= MAX_SMALL_BODY_PCT and c1[5] < c2[5]
+    small_green_0 = is_bullish(c0) and body_pct(c0) <= MAX_SMALL_BODY_PCT and c0[5] < c2[5]
+    return big_red and small_green_1 and small_green_0
 
 sent_signals = {}
 
 # === PROCESS SYMBOL ===
 def process_symbol(symbol, alert_queue):
-    # ... fetch candles, ema ...
-    if detect_rising_three(candles):
-        analysis = analyze_first_small_candle(candles[-3], 'rising')
-        if body_pct(candles[-3]) > BODY_SIZE_THRESHOLD: return
-        if sent_signals.get((symbol, 'rising')) == signal_time: return
-        sent_signals[(symbol, 'rising')] = signal_time
+    try:
+        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=30)
+        if len(candles) < 25: return
 
-        if first_close > ema21 and ema9 > ema21:
-            side = 'sell'
-            entry = second_close
-            tp = round_price(symbol, first_close * (1 - TP_PCT))
-            sl = round_price(symbol, entry * (1 + SL_PCT))
-            alert_queue.put((symbol, side, entry, tp, sl, analysis['text']))
+        ema21 = calculate_ema(candles, 21)
+        ema9 = calculate_ema(candles, 9)
+        if ema21 is None or ema9 is None: return
 
-    elif detect_falling_three(candles):
-        analysis = analyze_first_small_candle(candles[-3], 'falling')
-        # ... similar for falling ...
+        signal_time = candles[-2][0]
+        first_close = candles[-3][4]
+        second_close = candles[-2][4]
 
-# === SCAN LOOP (same as minimal version) ===
-# ... (with open_position call including analysis_text)
+        if detect_rising_three(candles):
+            analysis = analyze_first_small_candle(candles[-3], 'rising')
+            if body_pct(candles[-3]) > BODY_SIZE_THRESHOLD: return
+            if sent_signals.get((symbol, 'rising')) == signal_time: return
+            sent_signals[(symbol, 'rising')] = signal_time
 
-# === FLASK (RESTORED) ===
+            if first_close > ema21 and ema9 > ema21:
+                side = 'sell'
+                entry = second_close
+                tp = round_price(symbol, first_close * (1 - TP_PCT))
+                sl = round_price(symbol, entry * (1 + SL_PCT))
+                alert_queue.put((symbol, side, entry, tp, sl, analysis['text']))
+
+        elif detect_falling_three(candles):
+            analysis = analyze_first_small_candle(candles[-3], 'falling')
+            if body_pct(candles[-3]) > BODY_SIZE_THRESHOLD: return
+            if sent_signals.get((symbol, 'falling')) == signal_time: return
+            sent_signals[(symbol, 'falling')] = signal_time
+
+            if first_close < ema21 and ema9 < ema21:
+                side = 'buy'
+                entry = second_close
+                tp = round_price(symbol, first_close * (1 + TP_PCT))
+                sl = round_price(symbol, entry * (1 - SL_PCT))
+                alert_queue.put((symbol, side, entry, tp, sl, analysis['text']))
+    except Exception as e:
+        send_telegram(f"Error {symbol}: {e}")
+
+# === SCAN LOOP ===
+def scan_loop():
+    send_telegram("Bot started - Scanning began")
+    symbols = [s for s in exchange.load_markets() if 'USDT' in s and exchange.markets[s]['contract'] and exchange.markets[s]['active']]
+    chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
+    symbol_chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+
+    def get_next_close():
+        now = get_ist_time()
+        seconds_to_next = (15 * 60) - (now.minute * 60 + now.second) % (15 * 60)
+        if seconds_to_next < 5: seconds_to_next += 15 * 60
+        return time.time() + seconds_to_next
+
+    alert_queue = queue.Queue()
+
+    def process_alerts():
+        while True:
+            try:
+                symbol, side, entry, tp, sl, analysis_text = alert_queue.get(timeout=1)
+                with trade_lock:
+                    positions = exchange.fapiPrivate_get_positionrisk()
+                    open_count = sum(1 for p in positions if float(p['positionAmt']) != 0)
+                    if open_count >= MAX_OPEN_TRADES:
+                        send_telegram(f"Max trades reached ({open_count}) - skipping {symbol}")
+                        continue
+                    open_position(symbol, side, entry, tp, sl, analysis_text)
+            except queue.Empty:
+                time.sleep(1)
+            except Exception as e:
+                send_telegram(f"Alert error: {e}")
+
+    threading.Thread(target=process_alerts, daemon=True).start()
+
+    while True:
+        wait_time = max(0, get_next_close() - time.time())
+        send_telegram(f"Waiting {wait_time:.0f}s for next 15m candle")
+        time.sleep(wait_time)
+
+        for i, chunk in enumerate(symbol_chunks):
+            send_telegram(f"Scanning batch {i+1}/{NUM_CHUNKS}")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                for symbol in chunk:
+                    executor.submit(process_symbol, symbol, alert_queue)
+            if i < NUM_CHUNKS - 1:
+                time.sleep(BATCH_DELAY)
+
+        send_telegram("Scan complete")
+
+# === FLASK (KEEP ALIVE) ===
 @app.route('/')
 def home():
     return "✅ Rising & Falling Three Pattern Bot is Live!"

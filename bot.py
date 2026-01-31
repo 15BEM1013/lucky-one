@@ -49,8 +49,8 @@ def send_telegram(msg):
 # === INIT EXCHANGE ===
 def initialize_exchange():
     exchange = ccxt.binance({
-        'apiKey': 'T9inhK51iTAStVD0td5vZQwbB1OtX54AhYx12Q7rM1VdgfpYnklaUP2gTF0mGj3Z',
-        'secret': 'H1GkoQm8HeIKCYZSVhbtkVn2DUmUKdHXBjqH5vUEwLXRmRnJ29CXoXnz66eFplNZ',
+        'apiKey': '92h8f69jYEzd0sFaHxaVGI2EBk4GH7lYau6oPtb9MAIoZmdA2L8sFiycQxvEW8xX',
+        'secret': 's0lCo1RjuyLPAJciQnhUO8WTsC3SHXjeDuxEC4X31fNgybixwe9S2HNSt5akezDd',
         'options': {'defaultType': 'future'},
         'enableRateLimit': True,
     })

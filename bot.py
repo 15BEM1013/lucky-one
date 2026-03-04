@@ -12,8 +12,9 @@ import json
 import os
 import logging
 from dotenv import load_dotenv
-import os
+
 load_dotenv()
+
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -24,7 +25,7 @@ MIN_LOWER_WICK_PCT = 20.0
 MAX_WORKERS = 5
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
-CAPITAL = 20.0          # isolated margin per trade in USDT
+CAPITAL = 20.0  # isolated margin per trade in USDT
 LEVERAGE = 5
 TP_PCT = 1.0 / 100
 SL_PCT = 3.0 / 100
@@ -33,7 +34,7 @@ MAX_OPEN_TRADES = 5
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
 
-# === API KEYS FROM ENVIRONMENT (safer on VPS) ===
+# === API KEYS FROM ENVIRONMENT ===
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_SECRET')
 if not API_KEY or not API_SECRET:
@@ -154,6 +155,7 @@ def initialize_exchange():
             return exchange, proxies
         except Exception as e:
             logging.error(f"Proxy failed: {e}")
+    
     # Fallback direct
     try:
         exchange = ccxt.binance({
@@ -293,13 +295,13 @@ def daily_summary():
             closed = load_closed_trades()
             total_pnl = sum(t['pnl'] for t in closed)
             total_pnl_pct = sum(t['pnl_pct'] for t in closed)
-            
+           
             balance = exchange.fetch_balance()
             usdt = balance.get('USDT', {})
             free = usdt.get('free', 0)
             used = usdt.get('used', 0)
             total = free + used
-            
+           
             msg = (
                 f"📊 *Daily Summary*\n"
                 f"Total P/L (all-time): ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
@@ -319,14 +321,14 @@ def process_symbol(symbol, alert_queue):
         candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=10)
         if len(candles) < 6:
             return
-        
+       
         signal_time = candles[-2][0]
-        
+       
         with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
                 logging.info(f"Max {MAX_OPEN_TRADES} trades — skipping {symbol}")
                 return
-        
+       
         if detect_rising_three(candles):
             if sent_signals.get((symbol, 'rising')) == signal_time:
                 return
@@ -341,60 +343,114 @@ def process_symbol(symbol, alert_queue):
             pattern = 'falling'
         else:
             return
-        
+       
         # === LIVE TRADE ===
         try:
             prepare_symbol_for_trade(symbol)
-            
+           
             ticker = exchange.fetch_ticker(symbol)
             entry_price = round_price(symbol, ticker['last'])
-            
+           
             notional = CAPITAL * LEVERAGE
-            amount = exchange.amount_to_precision(symbol, notional / entry_price)
-            
+            amount = float(exchange.amount_to_precision(symbol, notional / entry_price))
+           
             entry_order = exchange.create_market_order(symbol, side, amount)
             filled_entry = entry_order.get('average') or entry_price
             filled_entry = round_price(symbol, filled_entry)
+           
+            # Buffer
+            BUFFER_FACTOR = 1.02
             
             if side == 'buy':
-                tp = round_price(symbol, filled_entry * (1 + TP_PCT))
-                sl = round_price(symbol, filled_entry * (1 - SL_PCT))
+                tp = round_price(symbol, filled_entry * (1 + TP_PCT * BUFFER_FACTOR))
+                sl = round_price(symbol, filled_entry * (1 - SL_PCT * BUFFER_FACTOR))
             else:
-                tp = round_price(symbol, filled_entry * (1 - TP_PCT))
-                sl = round_price(symbol, filled_entry * (1 + SL_PCT))
-            
+                tp = round_price(symbol, filled_entry * (1 - TP_PCT * BUFFER_FACTOR))
+                sl = round_price(symbol, filled_entry * (1 + SL_PCT * BUFFER_FACTOR))
+           
             close_side = 'sell' if side == 'buy' else 'buy'
-            
-            # TP order
-            exchange.create_order(
-                symbol, 'market', close_side, amount, None,
-                params={'reduceOnly': True, 'stopPrice': tp, 'type': 'TAKE_PROFIT_MARKET'}
-            )
-            # SL order
-            exchange.create_order(
-                symbol, 'market', close_side, amount, None,
-                params={'reduceOnly': True, 'stopPrice': sl, 'type': 'STOP_MARKET'}
-            )
-            
-            tp_dist = abs(tp - filled_entry) / filled_entry * 100
-            
-            msg = (
-                f"**LIVE TRADE OPENED** {symbol} - {'REVERSED BUY' if side=='buy' else 'REVERSED SELL'}\n"
+           
+            # Send ENTRY message right after entry
+            entry_msg = (
+                f"**ENTRY OPENED** {symbol} - {'REVERSED BUY' if side=='buy' else 'REVERSED SELL'}\n"
                 f"Entry (market): {filled_entry}\n"
-                f"TP: {tp} ({tp_dist:.2f}%)\n"
-                f"SL: {sl}\n"
-                f"Size: {amount}  (5x, margin ${CAPITAL})\n"
-                f"Pattern detected."
+                f"Pattern detected. Placing TP/SL..."
             )
+            message_id = send_telegram(entry_msg)
+           
+            if not message_id:
+                logging.warning(f"Telegram entry message failed for {symbol}")
+           
+            # Place TP + SL with correct types
+            try:
+                # TAKE PROFIT
+                exchange.create_order(
+                    symbol=symbol,
+                    type='TAKE_PROFIT_MARKET',
+                    side=close_side,
+                    amount=amount,
+                    price=None,
+                    params={
+                        'stopPrice': tp,
+                        'reduceOnly': True,
+                        'workingType': 'CONTRACT_PRICE'
+                    }
+                )
+                
+                # STOP LOSS
+                exchange.create_order(
+                    symbol=symbol,
+                    type='STOP_MARKET',
+                    side=close_side,
+                    amount=amount,
+                    price=None,
+                    params={
+                        'stopPrice': sl,
+                        'reduceOnly': True,
+                        'workingType': 'CONTRACT_PRICE'
+                    }
+                )
+                
+                # Success → edit message
+                tp_dist = abs(tp - filled_entry) / filled_entry * 100
+                success_msg = (
+                    f"**LIVE TRADE OPENED + TP/SL SET** {symbol} - {'REVERSED BUY' if side=='buy' else 'REVERSED SELL'}\n"
+                    f"Entry (market): {filled_entry}\n"
+                    f"TP: {tp} ({tp_dist:.2f}%)\n"
+                    f"SL: {sl}\n"
+                    f"Size: {amount} (5x, margin ${CAPITAL})\n"
+                    f"Pattern: {pattern}"
+                )
+                if message_id:
+                    edit_telegram_message(message_id, success_msg)
+                else:
+                    send_telegram(success_msg)
+                
+                logging.info(f"Opened + TP/SL placed {side} {symbol} @ {filled_entry}")
             
-            alert_queue.put((symbol, msg, side, filled_entry, tp, sl, pattern))
-            logging.info(f"Opened {side} {symbol} @ {filled_entry}")
+            except Exception as tp_sl_error:
+                logging.error(f"TP/SL placement failed for {symbol}: {str(tp_sl_error)}")
+                # No emergency close, no urgent telegram — as requested
+                # You may still want to monitor this symbol manually
             
+            # Register trade (even if TP/SL failed — position is open)
+            with trade_lock:
+                open_trades[symbol] = {
+                    'side': side,
+                    'entry': filled_entry,
+                    'tp': tp,
+                    'sl': sl,
+                    'msg': success_msg if 'success_msg' in locals() else entry_msg,
+                    'msg_id': message_id,
+                    'pattern': pattern
+                }
+                save_trades()
+           
         except ccxt.InsufficientFunds:
             logging.error(f"Insufficient funds for {symbol}")
         except Exception as e:
             logging.error(f"Trade failed {symbol}: {str(e)}")
-            
+           
     except Exception as e:
         logging.error(f"Process error {symbol}: {e}")
 
@@ -410,12 +466,12 @@ def scan_loop():
     load_trades()
     symbols = get_symbols()
     logging.info(f"Scanning {len(symbols)} symbols")
-    
+   
     alert_queue = queue.Queue()
-    
+   
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
     chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
-    
+   
     def send_alerts():
         while True:
             try:
@@ -433,23 +489,23 @@ def scan_loop():
                 time.sleep(1)
             except Exception as e:
                 logging.error(f"Alert error: {e}")
-    
+   
     threading.Thread(target=send_alerts, daemon=True).start()
     threading.Thread(target=check_tp_sl, daemon=True).start()
     threading.Thread(target=daily_summary, daemon=True).start()
-    
+   
     while True:
         next_close = get_next_candle_close()
         wait = max(0, next_close - time.time())
         logging.info(f"Waiting {wait:.0f}s for next 15m close")
         time.sleep(wait)
-        
+       
         for i, chunk in enumerate(chunks):
             logging.info(f"Batch {i+1}/{NUM_CHUNKS}")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
-        
+       
         logging.info("Scan complete")
 
 # === FLASK ===
@@ -461,9 +517,9 @@ def home():
 def run_bot():
     load_trades()
     num = len(open_trades)
-    startup = f"BOT STARTED\nTracking {num} open positions\nMax 5 trades | 5x | $20/trade"
+    startup = f"BOT STARTED\nTrackkkkking {num} open positions\nMaxx 5 trades | 5x | $20/trade"
     send_telegram(startup)
-    
+   
     threading.Thread(target=scan_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False)
 

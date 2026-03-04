@@ -1,12 +1,17 @@
+# render.yaml — Render.com service configuration
 services:
   - type: web
-    name: binance-pattern-bot
+    name: binance-futures-bot
     env: python
-    plan: free
-    buildCommand: ""
+    plan: free   # or 'starter', 'standard' depending on your choice
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
-      - key: BOT_TOKEN
-        value: your_telegram_bot_token
-      - key: CHAT_ID
-        value: your_telegram_chat_id
+      - key: BINANCE_API_KEY
+        value: ""   # leave empty if using .env on VPS, or fill here for Render secrets
+      - key: BINANCE_API_SECRET
+        value: ""
+      - key: TELEGRAM_BOT_TOKEN
+        value: ""
+      - key: TELEGRAM_CHAT_ID
+        value: ""

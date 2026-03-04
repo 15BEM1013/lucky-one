@@ -3,3 +3,4 @@ ccxt==4.3.35
 flask==3.0.3
 requests==2.32.3
 pytz==2024.2
+python-dotenv==1.0.0

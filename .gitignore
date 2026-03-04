@@ -1,0 +1,5 @@
+open_trades.json
+closed_trades.json
+__pycache__/
+.env
+venv/

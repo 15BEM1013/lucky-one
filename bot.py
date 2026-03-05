@@ -13,7 +13,8 @@ import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env reliably from the same directory as this script
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -221,7 +222,7 @@ def detect_falling_three(candles):
 # === SYMBOLS ===
 def get_symbols():
     markets = exchange.load_markets()
-    return [s for s in markets if 'USDT' in s and markets[s]['contract'] and markets[s].get('active') and markets[s].get('info', {}).get('status') == 'TRADING']
+    return [s for s in markets if 'USDT' in s and markets[s]['swap'] and markets[s].get('active')]
 
 # === PREPARE SYMBOL ===
 def prepare_symbol_for_trade(symbol):
@@ -295,13 +296,13 @@ def daily_summary():
             closed = load_closed_trades()
             total_pnl = sum(t['pnl'] for t in closed)
             total_pnl_pct = sum(t['pnl_pct'] for t in closed)
-           
+          
             balance = exchange.fetch_balance()
             usdt = balance.get('USDT', {})
             free = usdt.get('free', 0)
             used = usdt.get('used', 0)
             total = free + used
-           
+          
             msg = (
                 f"📊 *Daily Summary*\n"
                 f"Total P/L (all-time): ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
@@ -321,14 +322,14 @@ def process_symbol(symbol, alert_queue):
         candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=10)
         if len(candles) < 6:
             return
-       
+      
         signal_time = candles[-2][0]
-       
+      
         with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
                 logging.info(f"Max {MAX_OPEN_TRADES} trades — skipping {symbol}")
                 return
-       
+      
         if detect_rising_three(candles):
             if sent_signals.get((symbol, 'rising')) == signal_time:
                 return
@@ -343,33 +344,33 @@ def process_symbol(symbol, alert_queue):
             pattern = 'falling'
         else:
             return
-       
+      
         # === LIVE TRADE ===
         try:
             prepare_symbol_for_trade(symbol)
-           
+          
             ticker = exchange.fetch_ticker(symbol)
             entry_price = round_price(symbol, ticker['last'])
-           
+          
             notional = CAPITAL * LEVERAGE
             amount = float(exchange.amount_to_precision(symbol, notional / entry_price))
-           
+          
             entry_order = exchange.create_market_order(symbol, side, amount)
             filled_entry = entry_order.get('average') or entry_price
             filled_entry = round_price(symbol, filled_entry)
-           
-            # Buffer
+          
+            # Buffer for slippage
             BUFFER_FACTOR = 1.02
-            
+          
             if side == 'buy':
                 tp = round_price(symbol, filled_entry * (1 + TP_PCT * BUFFER_FACTOR))
                 sl = round_price(symbol, filled_entry * (1 - SL_PCT * BUFFER_FACTOR))
             else:
                 tp = round_price(symbol, filled_entry * (1 - TP_PCT * BUFFER_FACTOR))
                 sl = round_price(symbol, filled_entry * (1 + SL_PCT * BUFFER_FACTOR))
-           
+          
             close_side = 'sell' if side == 'buy' else 'buy'
-           
+          
             # Send ENTRY message right after entry
             entry_msg = (
                 f"**ENTRY OPENED** {symbol} - {'REVERSED BUY' if side=='buy' else 'REVERSED SELL'}\n"
@@ -377,40 +378,44 @@ def process_symbol(symbol, alert_queue):
                 f"Pattern detected. Placing TP/SL..."
             )
             message_id = send_telegram(entry_msg)
-           
+          
             if not message_id:
                 logging.warning(f"Telegram entry message failed for {symbol}")
-           
-            # Place TP + SL with correct types
+          
+            # === PLACE TP + SL USING ALGO ORDERS (One-way mode) ===
             try:
-                # TAKE PROFIT
-                exchange.create_order(
+                # TAKE PROFIT (takeProfitMarket)
+                tp_params = {
+                    'triggerPrice': str(tp),
+                    'reduceOnly': True,
+                    'workingType': 'CONTRACT_PRICE',
+                    'closePosition': True  # Ensures full position close in one-way mode
+                }
+                exchange.create_algo_order(
                     symbol=symbol,
-                    type='TAKE_PROFIT_MARKET',
+                    type='takeProfitMarket',
+                    side=close_side,
+                    amount=amount,  # optional with closePosition=True, but kept for safety
+                    params=tp_params
+                )
+                logging.info(f"TP algo order placed for {symbol} at {tp}")
+
+                # STOP LOSS (stopMarket)
+                sl_params = {
+                    'triggerPrice': str(sl),
+                    'reduceOnly': True,
+                    'workingType': 'CONTRACT_PRICE',
+                    'closePosition': True
+                }
+                exchange.create_algo_order(
+                    symbol=symbol,
+                    type='stopMarket',
                     side=close_side,
                     amount=amount,
-                    price=None,
-                    params={
-                        'stopPrice': tp,
-                        'reduceOnly': True,
-                        'workingType': 'CONTRACT_PRICE'
-                    }
+                    params=sl_params
                 )
-                
-                # STOP LOSS
-                exchange.create_order(
-                    symbol=symbol,
-                    type='STOP_MARKET',
-                    side=close_side,
-                    amount=amount,
-                    price=None,
-                    params={
-                        'stopPrice': sl,
-                        'reduceOnly': True,
-                        'workingType': 'CONTRACT_PRICE'
-                    }
-                )
-                
+                logging.info(f"SL algo order placed for {symbol} at {sl}")
+              
                 # Success → edit message
                 tp_dist = abs(tp - filled_entry) / filled_entry * 100
                 success_msg = (
@@ -425,14 +430,13 @@ def process_symbol(symbol, alert_queue):
                     edit_telegram_message(message_id, success_msg)
                 else:
                     send_telegram(success_msg)
-                
+              
                 logging.info(f"Opened + TP/SL placed {side} {symbol} @ {filled_entry}")
             
             except Exception as tp_sl_error:
                 logging.error(f"TP/SL placement failed for {symbol}: {str(tp_sl_error)}")
-                # No emergency close, no urgent telegram — as requested
-                # You may still want to monitor this symbol manually
-            
+                send_telegram(f"⚠️ Warning: TP/SL failed to place for {symbol} - position open, monitor manually!")
+          
             # Register trade (even if TP/SL failed — position is open)
             with trade_lock:
                 open_trades[symbol] = {
@@ -445,12 +449,12 @@ def process_symbol(symbol, alert_queue):
                     'pattern': pattern
                 }
                 save_trades()
-           
+          
         except ccxt.InsufficientFunds:
             logging.error(f"Insufficient funds for {symbol}")
         except Exception as e:
             logging.error(f"Trade failed {symbol}: {str(e)}")
-           
+          
     except Exception as e:
         logging.error(f"Process error {symbol}: {e}")
 
@@ -466,12 +470,12 @@ def scan_loop():
     load_trades()
     symbols = get_symbols()
     logging.info(f"Scanning {len(symbols)} symbols")
-   
+  
     alert_queue = queue.Queue()
-   
+  
     chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
     chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
-   
+  
     def send_alerts():
         while True:
             try:
@@ -489,23 +493,23 @@ def scan_loop():
                 time.sleep(1)
             except Exception as e:
                 logging.error(f"Alert error: {e}")
-   
+  
     threading.Thread(target=send_alerts, daemon=True).start()
     threading.Thread(target=check_tp_sl, daemon=True).start()
     threading.Thread(target=daily_summary, daemon=True).start()
-   
+  
     while True:
         next_close = get_next_candle_close()
         wait = max(0, next_close - time.time())
         logging.info(f"Waiting {wait:.0f}s for next 15m close")
         time.sleep(wait)
-       
+      
         for i, chunk in enumerate(chunks):
             logging.info(f"Batch {i+1}/{NUM_CHUNKS}")
             process_batch(chunk, alert_queue)
             if i < NUM_CHUNKS - 1:
                 time.sleep(BATCH_DELAY)
-       
+      
         logging.info("Scan complete")
 
 # === FLASK ===
@@ -519,7 +523,7 @@ def run_bot():
     num = len(open_trades)
     startup = f"BOT STARTED\nTrackkkkking {num} open positions\nMaxx 5 trades | 5x | $20/trade"
     send_telegram(startup)
-   
+  
     threading.Thread(target=scan_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False)
 

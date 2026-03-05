@@ -521,7 +521,7 @@ def home():
 def run_bot():
     load_trades()
     num = len(open_trades)
-    startup = f"BOT STARTED\nTracking_ALGO-1 {num} open positions\nMaxx 5 trades | 5x | $20/trade"
+    startup = f"BOT STARTED\nTracking_1 {num} open positions\nMaxx 5 trades | 5x | $20/trade"
     send_telegram(startup)
   
     threading.Thread(target=scan_loop, daemon=True).start()

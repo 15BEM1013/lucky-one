@@ -517,7 +517,7 @@ def home():
 def run_bot():
     load_trades()
     startup = (
-        f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
+        f"Bot hhhhhrestarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
         f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
         f"Initial: ${CAPITAL_INITIAL} → DCA +${CAPITAL_DCA} (max ${MAX_MARGIN_PER_TRADE})\n"

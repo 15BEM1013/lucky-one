@@ -26,11 +26,18 @@ MIN_LOWER_WICK_PCT = 20.0
 MAX_WORKERS      = 5
 BATCH_DELAY      = 2.0
 NUM_CHUNKS       = 8
-CAPITAL          = 20.0       # isolated margin per trade in USDT
+
+CAPITAL_INITIAL   = 10.0       # first entry margin USDT
+CAPITAL_DCA       = 20.0       # DCA add margin
+MAX_MARGIN_PER_TRADE = 30.0
+
 LEVERAGE         = 5
-TP_PCT           = 1.0 / 100
-SL_PCT           = 3.0 / 100
-TP_SL_CHECK_INTERVAL = 8      # seconds — fast enough for 1% targets
+TP_INITIAL_PCT   = 1.0 / 100
+TP_AFTER_DCA_PCT = 0.5 / 100
+DCA_TRIGGER_PCT  = 2.0 / 100
+
+TP_CHECK_INTERVAL = 8          # seconds
+
 MAX_OPEN_TRADES  = 5
 TRADE_FILE       = 'open_trades.json'
 CLOSED_TRADE_FILE= 'closed_trades.json'
@@ -114,8 +121,10 @@ def edit_telegram_message(mid, new_text):
 def initialize_exchange():
     for proxy in PROXY_LIST:
         try:
-            proxies = {'http': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}",
-                       'https': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}"}
+            proxies = {
+                'http': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}",
+                'https': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}"
+            }
             ex = ccxt.binance({
                 'apiKey': API_KEY, 'secret': API_SECRET,
                 'options': {'defaultType': 'future', 'marginMode': 'isolated'},
@@ -141,7 +150,7 @@ app = Flask(__name__)
 exchange = initialize_exchange()
 
 sent_signals = {}
-open_trades = {}   # {symbol: {'side':, 'entry':, 'tp':, 'sl':, 'amount':, 'msg_id':, ...}}
+open_trades = {}   # {symbol: { 'side', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_done', 'msg_id_initial', 'msg_id_dca', ... }}
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -209,88 +218,151 @@ def get_next_candle_close():
         secs_to += 15 * 60
     return time.time() + secs_to
 
-# === TP/SL MONITOR (internal) ===
-def check_tp_sl():
-    # Optional: try to use websocket for real-time prices
-    prices = {}  # symbol → current mark price
+# === HELPERS ===
+def get_avg_entry_and_total(trade):
+    total_pos = 0.0
+    weighted = 0.0
+    for e in trade['entries']:
+        weighted += e['price'] * e['amount']
+        total_pos += e['amount']
+    if total_pos == 0:
+        return 0.0, 0.0
+    return weighted / total_pos, total_pos
 
-    def update_prices():
+# === MONITOR TP + DCA (internal only) ===
+def monitor_tp_and_dca():
+    prices_cache = {}
+
+    def update_prices_ws():
         while True:
             try:
-                for sym in list(open_trades.keys()):
-                    ticker = exchange.watch_ticker(sym)  # or watch_mark_price if supported
-                    prices[sym] = ticker.get('markPrice') or ticker['last']
+                for sym in list(open_trades):
+                    ticker = exchange.watch_ticker(sym)
+                    prices_cache[sym] = ticker.get('last') or ticker.get('close')
             except Exception as e:
                 logging.debug(f"WS error: {e}")
-                time.sleep(2)
+                time.sleep(3)
 
-    threading.Thread(target=update_prices, daemon=True).start()
+    threading.Thread(target=update_prices_ws, daemon=True).start()
 
     while True:
         try:
             with trade_lock:
                 for sym, tr in list(open_trades.items()):
-                    try:
-                        # Get fresh price (prefer WS cache → REST fallback)
-                        current = prices.get(sym)
-                        if not current:
-                            pos_ticker = exchange.fetch_ticker(sym)
-                            current = pos_ticker.get('markPrice') or pos_ticker['last']
-
-                        hit_tp = (tr['side'] == 'buy' and current >= tr['tp']) or \
-                                 (tr['side'] == 'sell' and current <= tr['tp'])
-                        hit_sl = (tr['side'] == 'buy' and current <= tr['sl']) or \
-                                 (tr['side'] == 'sell' and current >= tr['sl'])
-
-                        if not (hit_tp or hit_sl):
+                    # Get current price
+                    current = prices_cache.get(sym)
+                    if not current:
+                        try:
+                            t = exchange.fetch_ticker(sym)
+                            current = t.get('last') or t.get('markPrice')
+                            prices_cache[sym] = current
+                        except:
                             continue
 
-                        # Close position
-                        close_side = 'sell' if tr['side'] == 'buy' else 'buy'
-                        close_order = exchange.create_order(
-                            sym, 'market', close_side, tr['amount'],
-                            params={'reduceOnly': True}
-                        )
-                        exit_price = close_order.get('average') or current
+                    is_long = tr['side'] == 'buy'
 
-                        # Calc pnl
-                        if tr['side'] == 'buy':
-                            pnl_pct = (exit_price - tr['entry']) / tr['entry'] * 100
-                        else:
-                            pnl_pct = (tr['entry'] - exit_price) / tr['entry'] * 100
-                        leveraged_pnl = pnl_pct * LEVERAGE
-                        profit_usdt = CAPITAL * leveraged_pnl / 100
+                    # 1. Check for DCA (only once)
+                    if not tr['dca_done']:
+                        trigger_level = tr['avg_entry'] * (1 - DCA_TRIGGER_PCT) if is_long else tr['avg_entry'] * (1 + DCA_TRIGGER_PCT)
+                        if (is_long and current <= trigger_level) or (not is_long and current >= trigger_level):
+                            try:
+                                used_margin = sum(e['margin'] for e in tr['entries'])
+                                if used_margin + CAPITAL_DCA > MAX_MARGIN_PER_TRADE:
+                                    logging.warning(f"{sym} DCA skipped - margin limit reached")
+                                    continue
 
-                        hit = "✅ TP" if hit_tp else "❌ SL"
-                        msg = (
-                            f"{sym} — {hit} HIT\n"
-                            f"Entry: {tr['entry']:.4f}\n"
-                            f"Exit:  {exit_price:.4f}\n"
-                            f"PnL:   {leveraged_pnl:.2f}%  (${profit_usdt:+.2f})\n"
-                            f"{'TP' if hit_tp else 'SL'} price: {tr['tp' if hit_tp else 'sl']:.4f}"
-                        )
+                                dca_amount_raw = (CAPITAL_DCA * LEVERAGE) / current
+                                dca_amount = float(round_amount(sym, dca_amount_raw))
+                                if dca_amount <= 0:
+                                    continue
 
-                        edit_telegram_message(tr.get('msg_id'), msg)
-                        save_closed_trade({
-                            'symbol': sym, 'pnl_usdt': profit_usdt,
-                            'pnl_pct': leveraged_pnl, 'hit': hit,
-                            'entry': tr['entry'], 'exit': exit_price,
-                            'ts': time.time()
-                        })
+                                dca_order = exchange.create_market_order(sym, tr['side'], dca_amount)
+                                dca_price = dca_order.get('average') or current
+                                dca_price = round_price(sym, dca_price)
 
-                        del open_trades[sym]
-                        save_trades()
-                        logging.info(f"Closed {sym} — {hit} — PnL ${profit_usdt:.2f}")
+                                # Update trade
+                                tr['entries'].append({
+                                    'price': dca_price,
+                                    'amount': dca_amount,
+                                    'margin': CAPITAL_DCA,
+                                    'ts': time.time()
+                                })
+                                tr['total_amount'] += dca_amount
+                                tr['avg_entry'], _ = get_avg_entry_and_total(tr)
+                                tr['dca_done'] = True
 
-                    except ccxt.OrderNotFillable as e:
-                        logging.warning(f"Close failed (not fillable) {sym}: {e}")
-                    except Exception as e:
-                        logging.error(f"TP/SL close error {sym}: {e}")
+                                # Update TP to 0.5%
+                                tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA_PCT))
 
-            time.sleep(TP_SL_CHECK_INTERVAL)
+                                dca_msg = (
+                                    f"**DCA TRIGGERED** {sym}\n"
+                                    f"DCA entry: {dca_price:.6f}\n"
+                                    f"Added: {dca_amount:.4f} (${CAPITAL_DCA:.0f})\n"
+                                    f"New avg: {tr['avg_entry']:.6f}\n"
+                                    f"New TP: {tr['tp']:.6f} ({TP_AFTER_DCA_PCT*100:.1f}% from avg)"
+                                )
+                                mid_dca = send_telegram(dca_msg)
+                                tr['msg_id_dca'] = mid_dca
+
+                                save_trades()
+                                logging.info(f"DCA added for {sym} @ {dca_price}")
+
+                            except Exception as e:
+                                logging.error(f"DCA failed for {sym}: {e}")
+
+                    # 2. Check TP
+                    hit_tp = (is_long and current >= tr['tp']) or (not is_long and current <= tr['tp'])
+                    if hit_tp:
+                        try:
+                            close_side = 'sell' if is_long else 'buy'
+                            close_order = exchange.create_order(
+                                sym, 'market', close_side, tr['total_amount'],
+                                params={'reduceOnly': True}
+                            )
+                            exit_price = close_order.get('average') or current
+                            exit_price = round_price(sym, exit_price)
+
+                            pnl_pct = ((exit_price - tr['avg_entry']) / tr['avg_entry']) * 100 if is_long else \
+                                      ((tr['avg_entry'] - exit_price) / tr['avg_entry']) * 100
+                            leveraged_pnl = pnl_pct * LEVERAGE
+                            total_margin_used = sum(e['margin'] for e in tr['entries'])
+                            profit_usdt = total_margin_used * (leveraged_pnl / 100)
+
+                            msg = (
+                                f"**TP HIT** {sym} — {'LONG' if is_long else 'SHORT'}\n"
+                                f"Avg entry: {tr['avg_entry']:.6f}\n"
+                                f"Exit: {exit_price:.6f}\n"
+                                f"Total size: {tr['total_amount']:.4f}\n"
+                                f"PnL: {leveraged_pnl:.2f}% (${profit_usdt:+.2f})\n"
+                                f"{'DCA used' if tr['dca_done'] else 'No DCA'}"
+                            )
+                            edit_telegram_message(tr['msg_id_initial'], msg)
+                            if tr.get('msg_id_dca'):
+                                edit_telegram_message(tr['msg_id_dca'], "Position closed on TP ↑")
+
+                            save_closed_trade({
+                                'symbol': sym,
+                                'pnl_usdt': profit_usdt,
+                                'pnl_pct': leveraged_pnl,
+                                'hit': 'TP',
+                                'avg_entry': tr['avg_entry'],
+                                'exit': exit_price,
+                                'dca_used': tr['dca_done'],
+                                'total_margin': total_margin_used,
+                                'ts': time.time()
+                            })
+
+                            del open_trades[sym]
+                            save_trades()
+                            logging.info(f"Closed {sym} on TP — PnL ${profit_usdt:.2f}")
+
+                        except Exception as e:
+                            logging.error(f"TP close failed {sym}: {e}")
+
+            time.sleep(TP_CHECK_INTERVAL)
 
         except Exception as e:
-            logging.error(f"TP/SL main loop error: {e}")
+            logging.error(f"Monitor loop error: {e}")
             time.sleep(30)
 
 # === PROCESS SYMBOL ===
@@ -300,7 +372,7 @@ def process_symbol(symbol, alert_queue):
         if len(candles) < 6:
             return
 
-        signal_time = candles[-1][0]  # most recent closed candle
+        signal_time = candles[-1][0]
 
         with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
@@ -320,14 +392,12 @@ def process_symbol(symbol, alert_queue):
         else:
             return
 
-        # Prepare & trade
         prepare_symbol(symbol)
 
         ticker = exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 
-        notional = CAPITAL * LEVERAGE
-        amount_raw = notional / entry_price
+        amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = float(round_amount(symbol, amount_raw))
 
         if amount <= 0:
@@ -338,37 +408,38 @@ def process_symbol(symbol, alert_queue):
         filled_price = entry_order.get('average') or entry_price
         filled_price = round_price(symbol, filled_price)
 
-        if side == 'buy':
-            tp = round_price(symbol, filled_price * (1 + TP_PCT))
-            sl = round_price(symbol, filled_price * (1 - SL_PCT))
-        else:
-            tp = round_price(symbol, filled_price * (1 - TP_PCT))
-            sl = round_price(symbol, filled_price * (1 + SL_PCT))
+        tp = round_price(symbol, filled_price * (1 + TP_INITIAL_PCT) if side == 'buy' else filled_price * (1 - TP_INITIAL_PCT))
 
         entry_msg = (
             f"**ENTRY** {symbol} — {'LONG' if side=='buy' else 'SHORT'}\n"
-            f"Entry: {filled_price:.4f}\n"
+            f"Entry: {filled_price:.6f}\n"
             f"Pattern: {pattern}\n"
-            f"Size: {amount} ({LEVERAGE}x)\n"
-            f"TP: {tp:.4f}  |  SL: {sl:.4f}\n"
-            f"Monitoring internally..."
+            f"Size: {amount:.4f} (${CAPITAL_INITIAL:.0f})\n"
+            f"TP: {tp:.6f} ({TP_INITIAL_PCT*100:.1f}%)\n"
+            f"No SL • Monitoring DCA/TP internally"
         )
         mid = send_telegram(entry_msg)
 
         with trade_lock:
             open_trades[symbol] = {
                 'side': side,
-                'entry': filled_price,
+                'entries': [{
+                    'price': filled_price,
+                    'amount': amount,
+                    'margin': CAPITAL_INITIAL,
+                    'ts': time.time()
+                }],
+                'total_amount': amount,
+                'avg_entry': filled_price,
                 'tp': tp,
-                'sl': sl,
-                'amount': amount,
-                'msg_id': mid,
-                'pattern': pattern,
+                'dca_done': False,
+                'msg_id_initial': mid,
+                'msg_id_dca': None,
                 'open_ts': time.time()
             }
             save_trades()
 
-        logging.info(f"Opened {side} {symbol} @ {filled_price} — TP/SL internal")
+        logging.info(f"Opened {side} {symbol} @ {filled_price}")
 
     except ccxt.InsufficientFunds:
         logging.error(f"Insufficient funds {symbol}")
@@ -380,8 +451,10 @@ def process_batch(symbols_chunk, q):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [ex.submit(process_symbol, s, q) for s in symbols_chunk]
         for f in as_completed(futures):
-            try: f.result()
-            except: pass
+            try:
+                f.result()
+            except:
+                pass
 
 # === SCAN LOOP ===
 def scan_loop():
@@ -389,9 +462,9 @@ def scan_loop():
     symbols = get_symbols()
     logging.info(f"Scanning {len(symbols)} USDT perpetuals")
 
-    alert_q = queue.Queue()  # not really used now — kept for compatibility
+    alert_q = queue.Queue()
 
-    threading.Thread(target=check_tp_sl, daemon=True).start()
+    threading.Thread(target=monitor_tp_and_dca, daemon=True).start()
 
     while True:
         wait_until = get_next_candle_close()
@@ -410,7 +483,7 @@ def scan_loop():
 
         logging.info("Full scan done")
 
-# === DAILY SUMMARY (optional — kept) ===
+# === DAILY SUMMARY ===
 def daily_summary():
     while True:
         time.sleep(86400)
@@ -428,8 +501,8 @@ def daily_summary():
 
             msg = (
                 f"📊 *Daily Summary*\n"
-                f"All-time PnL: ${total_pnl:.2f} ({total_pct:.2f}%)\n"
-                f"Open: {len(open_trades)}\n"
+                f"All-time PnL: ${total_pnl:.2f} (${total_pct:.2f}%)\n"
+                f"Open positions: {len(open_trades)}\n"
                 f"Total USDT: ${total:.2f}"
             )
             send_telegram(msg)
@@ -444,10 +517,11 @@ def home():
 def run_bot():
     load_trades()
     startup = (
-        f"Bot (re)starrrrted @ {get_ist_time().strftime('%Y-%m-%d %H:%M')}\n"
+        f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
-        f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x | ${CAPITAL}/trade\n"
-        f"TP: {TP_PCT*100:.1f}% | SL: {SL_PCT*100:.1f}% — **internal monitoring**"
+        f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
+        f"Initial: ${CAPITAL_INITIAL} → DCA +${CAPITAL_DCA} (max ${MAX_MARGIN_PER_TRADE})\n"
+        f"TP: {TP_INITIAL_PCT*100:.1f}% → {TP_AFTER_DCA_PCT*100:.1f}% after DCA • **No SL**"
     )
     send_telegram(startup)
 

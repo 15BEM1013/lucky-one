@@ -1,17 +1,16 @@
 import ccxt
-import ccxt.async_support as ccxt_async
 import time
 import threading
 import requests
 from flask import Flask
 from datetime import datetime
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import queue
 import json
 import os
 import logging
-import asyncio
 from dotenv import load_dotenv
 
 # Load .env
@@ -24,6 +23,9 @@ TIMEFRAME        = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
+MAX_WORKERS      = 2                  # Low to avoid rate limits
+BATCH_DELAY      = 1.0                # Minimal between batches
+NUM_CHUNKS       = 6                  # Fewer batches = less overhead
 
 CAPITAL_INITIAL   = 10.0
 CAPITAL_DCA       = 20.0
@@ -54,7 +56,7 @@ trade_lock = threading.Lock()
 def get_ist_time():
     return datetime.now(pytz.timezone('Asia/Kolkata'))
 
-# === TRADE PERSISTENCE (unchanged) ===
+# === TRADE PERSISTENCE ===
 def save_trades():
     try:
         with open(TRADE_FILE, 'w') as f:
@@ -86,7 +88,7 @@ def save_closed_trade(closed):
     except Exception as e:
         logging.error(f"Save closed trade error: {e}")
 
-# === TELEGRAM (unchanged) ===
+# === TELEGRAM ===
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -114,7 +116,7 @@ def edit_telegram_message(mid, new_text):
     except Exception as e:
         logging.error(f"Telegram edit error: {e}")
 
-# === FLASK APP ===
+# === FLASK APP (moved up) ===
 app = Flask(__name__)
 
 # === EXCHANGE ===
@@ -147,25 +149,10 @@ def initialize_exchange():
 
 exchange = initialize_exchange()
 
-# Async exchange for fast scanning
-async_exchange = None
-
-async def init_async_exchange():
-    global async_exchange
-    async_exchange = ccxt_async.binance({
-        'apiKey': API_KEY,
-        'secret': API_SECRET,
-        'options': {'defaultType': 'future', 'marginMode': 'isolated'},
-        'enableRateLimit': True,
-        'rateLimit': 100,  # ms
-    })
-    await async_exchange.load_markets()
-    logging.info("Async exchange ready")
-
 sent_signals = {}
 open_trades = {}
 
-# === CANDLE & PATTERN HELPERS (unchanged) ===
+# === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
 def is_bearish(c): return c[4] < c[1]
 def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
@@ -190,6 +177,7 @@ def round_amount(symbol, amt):
     except:
         return amt
 
+# === PATTERN ===
 def detect_rising_three(candles):
     if len(candles) < 6: return False
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
@@ -217,7 +205,7 @@ def prepare_symbol(symbol):
     try:
         exchange.set_margin_mode('isolated', symbol)
         exchange.set_leverage(LEVERAGE, symbol)
-        # logging.info(f"Prepared {symbol}")  # comment if too noisy
+        # logging.info(f"Prepared {symbol}")  # comment if noisy
     except Exception as e:
         logging.warning(f"Prepare {symbol} failed: {e}")
 
@@ -241,7 +229,7 @@ def get_avg_entry_and_total(trade):
         return 0.0, 0.0
     return weighted / total_pos, total_pos
 
-# === MONITOR TP + DCA (unchanged – websocket focused) ===
+# === MONITOR TP + DCA ===
 def monitor_tp_and_dca():
     prices_cache = {}
     last_fresh_time = {}
@@ -253,6 +241,7 @@ def monitor_tp_and_dca():
                 if not active_symbols:
                     time.sleep(12)
                     continue
+
                 tickers = exchange.watch_tickers(active_symbols)
                 now = time.time()
                 for sym, ticker in tickers.items():
@@ -261,7 +250,7 @@ def monitor_tp_and_dca():
                         prices_cache[sym] = price
                         last_fresh_time[sym] = now
             except Exception as e:
-                logging.debug(f"WS error: {e}")
+                logging.debug(f"WS error (retrying): {e}")
                 time.sleep(5)
 
     threading.Thread(target=update_prices_ws, daemon=True).start()
@@ -293,6 +282,7 @@ def monitor_tp_and_dca():
                             try:
                                 used_margin = sum(e['margin'] for e in tr['entries'])
                                 if used_margin + CAPITAL_DCA > MAX_MARGIN_PER_TRADE:
+                                    logging.warning(f"{sym} DCA skipped - margin limit")
                                     continue
 
                                 dca_amount_raw = (CAPITAL_DCA * LEVERAGE) / current
@@ -386,11 +376,11 @@ def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             time.sleep(30)
 
-# === ASYNC PROCESS SYMBOL ===
-async def process_symbol_async(symbol):
+# === PROCESS SYMBOL ===
+def process_symbol(symbol, alert_queue):
     try:
-        candles = await async_exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=5)
-        if len(candles) < 5:
+        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)
+        if len(candles) < 6:
             return
 
         signal_time = candles[-1][0]
@@ -415,7 +405,6 @@ async def process_symbol_async(symbol):
 
         prepare_symbol(symbol)
 
-        # For entry price we use sync exchange (small overhead)
         ticker = exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 
@@ -423,6 +412,7 @@ async def process_symbol_async(symbol):
         amount = float(round_amount(symbol, amount_raw))
 
         if amount <= 0:
+            logging.warning(f"Amount too small for {symbol}")
             return
 
         entry_order = exchange.create_market_order(symbol, side, amount)
@@ -462,46 +452,27 @@ async def process_symbol_async(symbol):
 
         logging.info(f"Opened {side} {symbol} @ {filled_price}")
 
+    except ccxt.InsufficientFunds:
+        logging.error(f"Insufficient funds {symbol}")
     except Exception as e:
-        logging.error(f"Async trade failed {symbol}: {str(e)}")
+        logging.error(f"Trade failed {symbol}: {str(e)}")
 
-# === ASYNC SCAN ===
-async def async_scan():
-    scan_start = time.time()
-
-    symbols = get_symbols()
-
-    # Bulk tickers (1 call)
-    try:
-        all_tickers = await async_exchange.fetch_tickers()
-    except Exception as e:
-        logging.error(f"Bulk tickers failed: {e}")
-        all_tickers = {}
-
-    promising = []
-    for sym in symbols:
-        t = all_tickers.get(sym, {})
-        if t.get('quoteVolume', 0) > 20000 or abs(t.get('percentage', 0)) > 0.3:
-            promising.append(sym)
-
-    logging.info(f"Processing {len(promising)} active symbols out of {len(symbols)}")
-
-    # Concurrent OHLCV fetches
-    tasks = [process_symbol_async(sym) for sym in promising]
-
-    # Run in batches of 50 to stay under rate limits
-    for i in range(0, len(tasks), 50):
-        batch = tasks[i:i+50]
-        await asyncio.gather(*batch, return_exceptions=True)
-        if i + 50 < len(tasks):
-            await asyncio.sleep(1.5)  # gentle pause
-
-    scan_duration = time.time() - scan_start
-    logging.info(f"Full async scan completed in {scan_duration:.1f} seconds")
+# === BATCH ===
+def process_batch(symbols_chunk, q):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(process_symbol, s, q) for s in symbols_chunk]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except:
+                pass
+            time.sleep(0.2)  # very small pause to avoid rate limit bursts
 
 # === SCAN LOOP ===
 def scan_loop():
     load_trades()
+    symbols = get_symbols()
+    logging.info(f"Scanning {len(symbols)} USDT perpetuals")
 
     alert_q = queue.Queue()
 
@@ -513,7 +484,37 @@ def scan_loop():
         logging.info(f"Next 15m close in ~{sleep_sec//60} min")
         time.sleep(sleep_sec)
 
-        asyncio.run(async_scan())
+        scan_start = time.time()
+
+        # Bulk tickers (1 call)
+        try:
+            all_tickers = exchange.fetch_tickers()
+        except Exception as e:
+            logging.error(f"Bulk tickers failed: {e}")
+            all_tickers = {}
+
+        # Filter promising symbols
+        promising = []
+        for sym in symbols:
+            t = all_tickers.get(sym, {})
+            vol = t.get('quoteVolume', 0)
+            chg = abs(t.get('percentage', 0))
+            if vol > 25000 or chg > 0.4:  # tune these if needed
+                promising.append(sym)
+
+        logging.info(f"Processing {len(promising)} active symbols out of {len(symbols)}")
+
+        chunk_size = math.ceil(len(promising) / NUM_CHUNKS)
+        chunks = [promising[i:i+chunk_size] for i in range(0, len(promising), chunk_size)]
+
+        for i, chunk in enumerate(chunks):
+            logging.info(f"Batch {i+1}/{len(chunks)}")
+            process_batch(chunk, alert_q)
+            if i < len(chunks)-1:
+                time.sleep(BATCH_DELAY)
+
+        scan_duration = time.time() - scan_start
+        logging.info(f"Full scan done - took {scan_duration:.1f} seconds")
 
 # === DAILY SUMMARY ===
 def daily_summary():
@@ -541,17 +542,14 @@ def daily_summary():
         except Exception as e:
             logging.error(f"Daily summary error: {e}")
 
-# === FLASK ===
+# === FLASK ROUTES ===
 @app.route('/')
 def home():
     return f"Bot running — {len(open_trades)} open trades | Max {MAX_OPEN_TRADES}"
 
+# === RUN ===
 def run_bot():
     load_trades()
-
-    # Start async exchange
-    asyncio.run(init_async_exchange())
-
     startup = (
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"

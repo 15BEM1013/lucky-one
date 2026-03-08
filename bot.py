@@ -43,7 +43,7 @@ API_SECRET = os.getenv('BINANCE_SECRET')
 if not API_KEY or not API_SECRET:
     raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
 
-PROXY_LIST = []  # add if needed
+PROXY_LIST = []  # format: [{"host": "...", "port": "...", "username": "...", "password": "..."}]
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -121,14 +121,18 @@ async def edit_telegram_message(mid, new_text):
 async def initialize_exchange():
     for proxy in PROXY_LIST:
         try:
+            # Fixed f-string syntax - using .format() style or separate variables is safer here
+            proxy_url = f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}"
             proxies = {
-                'http': f"http://{proxy.get("username")}:{proxy.get("password")}@{proxy["host"]}:{proxy["port"]}",
-                'https': f"http://{proxy.get("username")}:{proxy.get("password")}@{proxy["host"]}:{proxy["port"]}"
+                'http': proxy_url,
+                'https': proxy_url,
             }
             ex = ccxt.binance({
-                'apiKey': API_KEY, 'secret': API_SECRET,
+                'apiKey': API_KEY,
+                'secret': API_SECRET,
                 'options': {'defaultType': 'future', 'marginMode': 'isolated'},
-                'proxies': proxies, 'enableRateLimit': True,
+                'proxies': proxies,
+                'enableRateLimit': True,
             })
             await ex.load_markets()
             logging.info("Connected via proxy")
@@ -138,7 +142,8 @@ async def initialize_exchange():
 
     # fallback no proxy
     ex = ccxt.binance({
-        'apiKey': API_KEY, 'secret': API_SECRET,
+        'apiKey': API_KEY,
+        'secret': API_SECRET,
         'options': {'defaultType': 'future', 'marginMode': 'isolated'},
         'enableRateLimit': True,
     })
@@ -148,7 +153,7 @@ async def initialize_exchange():
 
 exchange = None
 sent_signals = {}
-open_trades = {}   # {symbol: { 'side', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_done', 'msg_id_initial', 'msg_id_dca', ... }}
+open_trades = {}   # {symbol: { 'side', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_done', ... }}
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -503,7 +508,7 @@ async def main():
     logging.info(f"Scanning {len(symbols)} USDT perpetuals")
 
     startup = (
-        f"Bot restartsssed @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
+        f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
         f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
         f"Initial: ${CAPITAL_INITIAL} → DCA +${CAPITAL_DCA} (max ${MAX_MARGIN_PER_TRADE})\n"

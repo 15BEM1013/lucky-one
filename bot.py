@@ -1,17 +1,14 @@
-import ccxt
+import ccxt.async_support as ccxt
+import asyncio
+import aiohttp
 import time
-import threading
-import requests
-from flask import Flask
-from datetime import datetime
-import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
-import queue
 import json
 import os
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
+import pytz
+import math
 
 # Load .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
@@ -23,7 +20,6 @@ TIMEFRAME        = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS      = 5
 BATCH_DELAY      = 2.0
 NUM_CHUNKS       = 8
 
@@ -52,7 +48,7 @@ PROXY_LIST = []  # add if needed
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-trade_lock = threading.Lock()
+trade_lock = asyncio.Lock()
 
 def get_ist_time():
     return datetime.now(pytz.timezone('Asia/Kolkata'))
@@ -89,48 +85,52 @@ def save_closed_trade(closed):
     except Exception as e:
         logging.error(f"Save closed trade error: {e}")
 
-# === TELEGRAM ===
-def send_telegram(msg):
+# === TELEGRAM (async) ===
+async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data={
-            'chat_id': CHAT_ID,
-            'text': msg,
-            'parse_mode': 'Markdown'
-        }, timeout=10).json()
-        return r.get('result', {}).get('message_id')
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={
+                'chat_id': CHAT_ID,
+                'text': msg,
+                'parse_mode': 'Markdown'
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                r = await resp.json()
+                return r.get('result', {}).get('message_id')
     except Exception as e:
         logging.error(f"Telegram send error: {e}")
         return None
 
-def edit_telegram_message(mid, new_text):
+async def edit_telegram_message(mid, new_text):
     if not mid:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     try:
-        requests.post(url, data={
-            'chat_id': CHAT_ID,
-            'message_id': mid,
-            'text': new_text,
-            'parse_mode': 'Markdown'
-        }, timeout=10)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={
+                'chat_id': CHAT_ID,
+                'message_id': mid,
+                'text': new_text,
+                'parse_mode': 'Markdown'
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                await resp.release()
     except Exception as e:
         logging.error(f"Telegram edit error: {e}")
 
 # === EXCHANGE ===
-def initialize_exchange():
+async def initialize_exchange():
     for proxy in PROXY_LIST:
         try:
             proxies = {
-                'http': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}",
-                'https': f"http://{proxy.get('username')}:{proxy.get('password')}@{proxy['host']}:{proxy['port']}"
+                'http': f"http://{proxy.get("username")}:{proxy.get("password")}@{proxy["host"]}:{proxy["port"]}",
+                'https': f"http://{proxy.get("username")}:{proxy.get("password")}@{proxy["host"]}:{proxy["port"]}"
             }
             ex = ccxt.binance({
                 'apiKey': API_KEY, 'secret': API_SECRET,
                 'options': {'defaultType': 'future', 'marginMode': 'isolated'},
                 'proxies': proxies, 'enableRateLimit': True,
             })
-            ex.load_markets()
+            await ex.load_markets()
             logging.info("Connected via proxy")
             return ex
         except Exception as e:
@@ -142,13 +142,11 @@ def initialize_exchange():
         'options': {'defaultType': 'future', 'marginMode': 'isolated'},
         'enableRateLimit': True,
     })
-    ex.load_markets()
+    await ex.load_markets()
     logging.info("Connected directly")
     return ex
 
-app = Flask(__name__)
-exchange = initialize_exchange()
-
+exchange = None
 sent_signals = {}
 open_trades = {}   # {symbol: { 'side', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_done', 'msg_id_initial', 'msg_id_dca', ... }}
 
@@ -197,14 +195,13 @@ def detect_falling_three(candles):
     return big_red and small_green_1 and small_green_0
 
 # === SYMBOLS ===
-def get_symbols():
-    markets = exchange.load_markets()
+def get_symbols(markets):
     return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
 
-def prepare_symbol(symbol):
+async def prepare_symbol(symbol):
     try:
-        exchange.set_margin_mode('isolated', symbol)
-        exchange.set_leverage(LEVERAGE, symbol)
+        await exchange.set_margin_mode('isolated', symbol)
+        await exchange.set_leverage(LEVERAGE, symbol)
         logging.info(f"Prepared {symbol}: isolated + {LEVERAGE}x")
     except Exception as e:
         logging.warning(f"Prepare {symbol} failed: {e}")
@@ -229,33 +226,32 @@ def get_avg_entry_and_total(trade):
         return 0.0, 0.0
     return weighted / total_pos, total_pos
 
-# === MONITOR TP + DCA (internal only) ===
-def monitor_tp_and_dca():
-    prices_cache = {}
-
-    def update_prices_ws():
-        while True:
-            try:
-                for sym in list(open_trades):
-                    ticker = exchange.watch_ticker(sym)
-                    prices_cache[sym] = ticker.get('last') or ticker.get('close')
-            except Exception as e:
-                logging.debug(f"WS error: {e}")
-                time.sleep(3)
-
-    threading.Thread(target=update_prices_ws, daemon=True).start()
-
+# === MONITOR TP + DCA (async, no WS) ===
+async def monitor_tp_and_dca():
     while True:
         try:
-            with trade_lock:
-                for sym, tr in list(open_trades.items()):
-                    # Get current price
-                    current = prices_cache.get(sym)
+            async with trade_lock:
+                open_symbols = list(open_trades.keys())
+                if not open_symbols:
+                    await asyncio.sleep(TP_CHECK_INTERVAL)
+                    continue
+
+                # Batch fetch prices
+                prices = {}
+                try:
+                    tickers = await exchange.fetch_tickers(open_symbols)
+                    for sym, t in tickers.items():
+                        prices[sym] = t.get('last') or t.get('close') or t.get('markPrice')
+                except Exception as e:
+                    logging.warning(f"Batch tickers error: {e}")
+
+                for sym in list(open_trades):
+                    tr = open_trades[sym]
+                    current = prices.get(sym)
                     if not current:
                         try:
-                            t = exchange.fetch_ticker(sym)
+                            t = await exchange.fetch_ticker(sym)
                             current = t.get('last') or t.get('markPrice')
-                            prices_cache[sym] = current
                         except:
                             continue
 
@@ -276,7 +272,7 @@ def monitor_tp_and_dca():
                                 if dca_amount <= 0:
                                     continue
 
-                                dca_order = exchange.create_market_order(sym, tr['side'], dca_amount)
+                                dca_order = await exchange.create_market_order(sym, tr['side'], dca_amount)
                                 dca_price = dca_order.get('average') or current
                                 dca_price = round_price(sym, dca_price)
 
@@ -301,10 +297,10 @@ def monitor_tp_and_dca():
                                     f"New avg: {tr['avg_entry']:.6f}\n"
                                     f"New TP: {tr['tp']:.6f} ({TP_AFTER_DCA_PCT*100:.1f}% from avg)"
                                 )
-                                mid_dca = send_telegram(dca_msg)
+                                mid_dca = await send_telegram(dca_msg)
                                 tr['msg_id_dca'] = mid_dca
 
-                                save_trades()
+                                await asyncio.to_thread(save_trades)
                                 logging.info(f"DCA added for {sym} @ {dca_price}")
 
                             except Exception as e:
@@ -315,7 +311,7 @@ def monitor_tp_and_dca():
                     if hit_tp:
                         try:
                             close_side = 'sell' if is_long else 'buy'
-                            close_order = exchange.create_order(
+                            close_order = await exchange.create_order(
                                 sym, 'market', close_side, tr['total_amount'],
                                 params={'reduceOnly': True}
                             )
@@ -336,11 +332,11 @@ def monitor_tp_and_dca():
                                 f"PnL: {leveraged_pnl:.2f}% (${profit_usdt:+.2f})\n"
                                 f"{'DCA used' if tr['dca_done'] else 'No DCA'}"
                             )
-                            edit_telegram_message(tr['msg_id_initial'], msg)
+                            await edit_telegram_message(tr['msg_id_initial'], msg)
                             if tr.get('msg_id_dca'):
-                                edit_telegram_message(tr['msg_id_dca'], "Position closed on TP ↑")
+                                await edit_telegram_message(tr['msg_id_dca'], "Position closed on TP ↑")
 
-                            save_closed_trade({
+                            await asyncio.to_thread(save_closed_trade, {
                                 'symbol': sym,
                                 'pnl_usdt': profit_usdt,
                                 'pnl_pct': leveraged_pnl,
@@ -353,28 +349,28 @@ def monitor_tp_and_dca():
                             })
 
                             del open_trades[sym]
-                            save_trades()
+                            await asyncio.to_thread(save_trades)
                             logging.info(f"Closed {sym} on TP — PnL ${profit_usdt:.2f}")
 
                         except Exception as e:
                             logging.error(f"TP close failed {sym}: {e}")
 
-            time.sleep(TP_CHECK_INTERVAL)
+            await asyncio.sleep(TP_CHECK_INTERVAL)
 
         except Exception as e:
             logging.error(f"Monitor loop error: {e}")
-            time.sleep(30)
+            await asyncio.sleep(30)
 
-# === PROCESS SYMBOL ===
-def process_symbol(symbol, alert_queue):
+# === PROCESS SYMBOL (async) ===
+async def process_symbol(symbol):
     try:
-        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=10)
+        candles = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)
         if len(candles) < 6:
             return
 
         signal_time = candles[-1][0]
 
-        with trade_lock:
+        async with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
                 return
             if sent_signals.get((symbol, 'rising')) == signal_time or \
@@ -392,9 +388,9 @@ def process_symbol(symbol, alert_queue):
         else:
             return
 
-        prepare_symbol(symbol)
+        await prepare_symbol(symbol)
 
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
@@ -404,7 +400,7 @@ def process_symbol(symbol, alert_queue):
             logging.warning(f"Amount too small for {symbol}")
             return
 
-        entry_order = exchange.create_market_order(symbol, side, amount)
+        entry_order = await exchange.create_market_order(symbol, side, amount)
         filled_price = entry_order.get('average') or entry_price
         filled_price = round_price(symbol, filled_price)
 
@@ -418,9 +414,9 @@ def process_symbol(symbol, alert_queue):
             f"TP: {tp:.6f} ({TP_INITIAL_PCT*100:.1f}%)\n"
             f"No SL • Monitoring DCA/TP internally"
         )
-        mid = send_telegram(entry_msg)
+        mid = await send_telegram(entry_msg)
 
-        with trade_lock:
+        async with trade_lock:
             open_trades[symbol] = {
                 'side': side,
                 'entries': [{
@@ -437,7 +433,7 @@ def process_symbol(symbol, alert_queue):
                 'msg_id_dca': None,
                 'open_ts': time.time()
             }
-            save_trades()
+            await asyncio.to_thread(save_trades)
 
         logging.info(f"Opened {side} {symbol} @ {filled_price}")
 
@@ -446,47 +442,34 @@ def process_symbol(symbol, alert_queue):
     except Exception as e:
         logging.error(f"Trade failed {symbol}: {str(e)}")
 
-# === BATCH ===
-def process_batch(symbols_chunk, q):
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_symbol, s, q) for s in symbols_chunk]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except:
-                pass
+# === BATCH (async) ===
+async def process_batch(symbols_chunk):
+    tasks = [asyncio.create_task(process_symbol(s)) for s in symbols_chunk]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-# === SCAN LOOP ===
-def scan_loop():
-    load_trades()
-    symbols = get_symbols()
-    logging.info(f"Scanning {len(symbols)} USDT perpetuals")
-
-    alert_q = queue.Queue()
-
-    threading.Thread(target=monitor_tp_and_dca, daemon=True).start()
-
+# === SCAN LOOP (async) ===
+async def scan_loop(symbols):
     while True:
         wait_until = get_next_candle_close()
         sleep_sec = max(0, wait_until - time.time())
         logging.info(f"Next 15m close in ~{sleep_sec//60} min")
-        time.sleep(sleep_sec)
+        await asyncio.sleep(sleep_sec)
 
         chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
         chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
 
         for i, chunk in enumerate(chunks):
             logging.info(f"Batch {i+1}/{len(chunks)}")
-            process_batch(chunk, alert_q)
+            await process_batch(chunk)
             if i < len(chunks)-1:
-                time.sleep(BATCH_DELAY)
+                await asyncio.sleep(BATCH_DELAY)
 
         logging.info("Full scan done")
 
-# === DAILY SUMMARY ===
-def daily_summary():
+# === DAILY SUMMARY (async) ===
+async def daily_summary():
     while True:
-        time.sleep(86400)
+        await asyncio.sleep(86400)
         try:
             closed = []
             if os.path.exists(CLOSED_TRADE_FILE):
@@ -495,7 +478,7 @@ def daily_summary():
             total_pnl = sum(t.get('pnl_usdt', 0) for t in closed)
             total_pct = sum(t.get('pnl_pct', 0) for t in closed)
 
-            bal = exchange.fetch_balance()
+            bal = await exchange.fetch_balance()
             usdt = bal.get('USDT', {})
             total = usdt.get('free', 0) + usdt.get('used', 0)
 
@@ -505,17 +488,20 @@ def daily_summary():
                 f"Open positions: {len(open_trades)}\n"
                 f"Total USDT: ${total:.2f}"
             )
-            send_telegram(msg)
+            await send_telegram(msg)
         except Exception as e:
             logging.error(f"Daily summary error: {e}")
 
-# === FLASK + RUN ===
-@app.route('/')
-def home():
-    return f"Bot running — {len(open_trades)} open trades | Max {MAX_OPEN_TRADES}"
+# === MAIN ===
+async def main():
+    global exchange
+    exchange = await initialize_exchange()
+    markets = exchange.markets
+    symbols = get_symbols(markets)
 
-def run_bot():
     load_trades()
+    logging.info(f"Scanning {len(symbols)} USDT perpetuals")
+
     startup = (
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
@@ -523,12 +509,14 @@ def run_bot():
         f"Initial: ${CAPITAL_INITIAL} → DCA +${CAPITAL_DCA} (max ${MAX_MARGIN_PER_TRADE})\n"
         f"TP: {TP_INITIAL_PCT*100:.1f}% → {TP_AFTER_DCA_PCT*100:.1f}% after DCA • **No SL**"
     )
-    send_telegram(startup)
+    await send_telegram(startup)
 
-    threading.Thread(target=scan_loop, daemon=True).start()
-    threading.Thread(target=daily_summary, daemon=True).start()
-
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    tasks = [
+        asyncio.create_task(scan_loop(symbols)),
+        asyncio.create_task(monitor_tp_and_dca()),
+        asyncio.create_task(daily_summary()),
+    ]
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    run_bot()
+    asyncio.run(main())

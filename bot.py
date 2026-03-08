@@ -1,5 +1,4 @@
 import ccxt
-import ccxt.async_support as ccxt_async  # ← new: for async fetching
 import time
 import threading
 import requests
@@ -12,7 +11,6 @@ import queue
 import json
 import os
 import logging
-import asyncio  # ← new: for async scan
 from dotenv import load_dotenv
 
 # Load .env
@@ -25,9 +23,9 @@ TIMEFRAME        = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS      = 3  # for any sync fallbacks
-BATCH_DELAY      = 2.0  # not used in async, but kept for compatibility
-NUM_CHUNKS       = 8   # not used in async
+MAX_WORKERS      = 3                  # Reduced from 5 to lower CPU spikes
+BATCH_DELAY      = 4.0                # Increased from 2.0 for better load spreading
+NUM_CHUNKS       = 10                 # Slightly more chunks → smaller batches
 
 CAPITAL_INITIAL   = 10.0
 CAPITAL_DCA       = 20.0
@@ -51,6 +49,7 @@ if not API_KEY or not API_SECRET:
 
 PROXY_LIST = []
 
+# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 trade_lock = threading.Lock()
@@ -118,6 +117,9 @@ def edit_telegram_message(mid, new_text):
     except Exception as e:
         logging.error(f"Telegram edit error: {e}")
 
+# === FLASK APP (moved up so routes work) ===
+app = Flask(__name__)
+
 # === EXCHANGE ===
 def initialize_exchange():
     for proxy in PROXY_LIST:
@@ -137,6 +139,7 @@ def initialize_exchange():
         except Exception as e:
             logging.warning(f"Proxy failed: {e}")
 
+    # fallback no proxy
     ex = ccxt.binance({
         'apiKey': API_KEY, 'secret': API_SECRET,
         'options': {'defaultType': 'future', 'marginMode': 'isolated'},
@@ -146,22 +149,7 @@ def initialize_exchange():
     logging.info("Connected directly")
     return ex
 
-# Global sync exchange for orders / monitoring
 exchange = initialize_exchange()
-
-# Global async exchange for fast scanning
-async_exchange = None
-
-async def init_async_exchange():
-    global async_exchange
-    async_exchange = ccxt_async.binance({
-        'apiKey': API_KEY, 'secret': API_SECRET,
-        'options': {'defaultType': 'future', 'marginMode': 'isolated'},
-        'enableRateLimit': True,
-        'rateLimit': 150,  # ms — conservative for speed
-    })
-    await async_exchange.load_markets()
-    logging.info("Async exchange initialized")
 
 sent_signals = {}
 open_trades = {}
@@ -243,19 +231,29 @@ def get_avg_entry_and_total(trade):
         return 0.0, 0.0
     return weighted / total_pos, total_pos
 
-# === MONITOR TP + DCA (internal only) ===
+# === MONITOR TP + DCA (websocket priority + stale fallback) ===
 def monitor_tp_and_dca():
-    prices_cache = {}
+    prices_cache = {}           # symbol → price
+    last_fresh_time = {}        # symbol → last update timestamp
 
     def update_prices_ws():
         while True:
             try:
-                for sym in list(open_trades):
-                    ticker = exchange.watch_ticker(sym)
-                    prices_cache[sym] = ticker.get('last') or ticker.get('close')
+                active_symbols = list(open_trades.keys())
+                if not active_symbols:
+                    time.sleep(12)
+                    continue
+
+                tickers = exchange.watch_tickers(active_symbols)
+                now = time.time()
+                for sym, ticker in tickers.items():
+                    price = ticker.get('last') or ticker.get('close') or ticker.get('markPrice')
+                    if price:
+                        prices_cache[sym] = price
+                        last_fresh_time[sym] = now
             except Exception as e:
-                logging.debug(f"WS error: {e}")
-                time.sleep(3)
+                logging.debug(f"WS error (retrying): {e}")
+                time.sleep(5)
 
     threading.Thread(target=update_prices_ws, daemon=True).start()
 
@@ -264,24 +262,31 @@ def monitor_tp_and_dca():
             with trade_lock:
                 for sym, tr in list(open_trades.items()):
                     current = prices_cache.get(sym)
-                    if not current:
+                    last_time = last_fresh_time.get(sym, 0)
+
+                    # Fallback if websocket data is stale (>12 seconds)
+                    if current is None or (time.time() - last_time) > 12:
                         try:
                             t = exchange.fetch_ticker(sym)
                             current = t.get('last') or t.get('markPrice')
                             prices_cache[sym] = current
+                            last_fresh_time[sym] = time.time()
                         except:
                             continue
 
+                    if current is None:
+                        continue
+
                     is_long = tr['side'] == 'buy'
 
-                    # 1. Check for DCA (only once)
+                    # DCA check
                     if not tr['dca_done']:
                         trigger_level = tr['avg_entry'] * (1 - DCA_TRIGGER_PCT) if is_long else tr['avg_entry'] * (1 + DCA_TRIGGER_PCT)
                         if (is_long and current <= trigger_level) or (not is_long and current >= trigger_level):
                             try:
                                 used_margin = sum(e['margin'] for e in tr['entries'])
                                 if used_margin + CAPITAL_DCA > MAX_MARGIN_PER_TRADE:
-                                    logging.warning(f"{sym} DCA skipped - margin limit reached")
+                                    logging.warning(f"{sym} DCA skipped - margin limit")
                                     continue
 
                                 dca_amount_raw = (CAPITAL_DCA * LEVERAGE) / current
@@ -293,7 +298,6 @@ def monitor_tp_and_dca():
                                 dca_price = dca_order.get('average') or current
                                 dca_price = round_price(sym, dca_price)
 
-                                # Update trade
                                 tr['entries'].append({
                                     'price': dca_price,
                                     'amount': dca_amount,
@@ -304,7 +308,6 @@ def monitor_tp_and_dca():
                                 tr['avg_entry'], _ = get_avg_entry_and_total(tr)
                                 tr['dca_done'] = True
 
-                                # Update TP to 0.5%
                                 tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA_PCT))
 
                                 dca_msg = (
@@ -323,7 +326,7 @@ def monitor_tp_and_dca():
                             except Exception as e:
                                 logging.error(f"DCA failed for {sym}: {e}")
 
-                    # 2. Check TP
+                    # TP check
                     hit_tp = (is_long and current >= tr['tp']) or (not is_long and current <= tr['tp'])
                     if hit_tp:
                         try:
@@ -378,10 +381,12 @@ def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             time.sleep(30)
 
-# === ASYNC PROCESS SYMBOL ===
-async def process_symbol_async(symbol, alert_queue):
+# === PROCESS SYMBOL (with micro-pauses) ===
+def process_symbol(symbol, alert_queue):
     try:
-        candles = await async_exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)  # ← limit=6
+        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)  # Changed to 6
+        time.sleep(0.12)  # micro-pause after OHLCV
+
         if len(candles) < 6:
             return
 
@@ -405,10 +410,12 @@ async def process_symbol_async(symbol, alert_queue):
         else:
             return
 
-        # Sync calls (orders) — fine in async context
         prepare_symbol(symbol)
+        time.sleep(0.08)  # micro-pause
 
-        ticker = exchange.fetch_ticker(symbol)  # sync fallback
+        ticker = exchange.fetch_ticker(symbol)
+        time.sleep(0.10)  # micro-pause after ticker
+
         entry_price = round_price(symbol, ticker['last'])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
@@ -419,6 +426,8 @@ async def process_symbol_async(symbol, alert_queue):
             return
 
         entry_order = exchange.create_market_order(symbol, side, amount)
+        time.sleep(0.25)  # micro-pause after order
+
         filled_price = entry_order.get('average') or entry_price
         filled_price = round_price(symbol, filled_price)
 
@@ -460,39 +469,18 @@ async def process_symbol_async(symbol, alert_queue):
     except Exception as e:
         logging.error(f"Trade failed {symbol}: {str(e)}")
 
-# === ASYNC SCAN (bulk tickers + filter + async OHLCV) ===
-async def async_scan(symbols, alert_queue):
-    scan_start = time.time()
+# === BATCH ===
+def process_batch(symbols_chunk, q):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(process_symbol, s, q) for s in symbols_chunk]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except:
+                pass
+            time.sleep(0.4)  # breathing pause after each symbol
 
-    # Step 1: Bulk fetch all tickers (1 call for all symbols — super fast)
-    all_tickers = await async_exchange.fetch_tickers()
-    promising_symbols = []
-
-    for sym in symbols:
-        if sym in all_tickers:
-            t = all_tickers[sym]
-            # Filter: only process if 24h volume > $50k or price change >0.5%
-            if t['quoteVolume'] > 50000 or abs(t['percentage']) > 0.5:
-                promising_symbols.append(sym)
-
-    logging.info(f"Filtered to {len(promising_symbols)} promising symbols out of {len(symbols)}")
-
-    # Step 2: Async gather OHLCV for promising ones (concurrency limit to avoid rate limits)
-    tasks = []
-    for symbol in promising_symbols:
-        tasks.append(process_symbol_async(symbol, alert_queue))
-        if len(tasks) >= 45:  # tune this — 45 concurrent is safe for Binance
-            await asyncio.gather(*tasks, return_exceptions=True)
-            tasks = []
-            await asyncio.sleep(0.8)  # gentle pause
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    scan_duration = time.time() - scan_start
-    logging.info(f"Full async scan took {scan_duration:.1f} seconds")
-
-# === SCAN LOOP (now async) ===
+# === SCAN LOOP ===
 def scan_loop():
     load_trades()
     symbols = get_symbols()
@@ -508,10 +496,18 @@ def scan_loop():
         logging.info(f"Next 15m close in ~{sleep_sec//60} min")
         time.sleep(sleep_sec)
 
-        # Run async scan
-        asyncio.run(async_scan(symbols, alert_q))
+        chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
+        chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
 
-        logging.info("Full scan done")
+        scan_start = time.time()
+        for i, chunk in enumerate(chunks):
+            logging.info(f"Batch {i+1}/{len(chunks)}")
+            process_batch(chunk, alert_q)
+            if i < len(chunks)-1:
+                time.sleep(BATCH_DELAY)
+
+        scan_duration = time.time() - scan_start
+        logging.info(f"Full scan done - took {scan_duration:.1f} seconds")
 
 # === DAILY SUMMARY ===
 def daily_summary():
@@ -539,15 +535,14 @@ def daily_summary():
         except Exception as e:
             logging.error(f"Daily summary error: {e}")
 
-# === FLASK + RUN ===
+# === FLASK ROUTES ===
 @app.route('/')
 def home():
     return f"Bot running — {len(open_trades)} open trades | Max {MAX_OPEN_TRADES}"
 
+# === RUN ===
 def run_bot():
     load_trades()
-    # Init async exchange
-    asyncio.run(init_async_exchange())
     startup = (
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"

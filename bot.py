@@ -84,7 +84,7 @@ def save_closed_trade(closed):
         logging.error(f"Save closed trade error: {e}")
 
 # === PATTERN STATE ===
-pattern_states = {}  # symbol → {'stage': 0/1/2, 'big_ts': ms, 'big_data': [o,h,l,c,v], 'sent': bool}
+pattern_states = {}
 
 def save_pattern_states():
     try:
@@ -148,6 +148,18 @@ logging.info("Exchange connected")
 sent_signals = {}
 open_trades = {}
 
+# === SYMBOLS ===
+def get_symbols():
+    markets = exchange.load_markets()
+    return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
+
+def prepare_symbol(symbol):
+    try:
+        exchange.set_margin_mode('isolated', symbol)
+        exchange.set_leverage(LEVERAGE, symbol)
+    except Exception as e:
+        logging.warning(f"Prepare {symbol} failed: {e}")
+
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
 def is_bearish(c): return c[4] < c[1]
@@ -173,13 +185,6 @@ def round_amount(symbol, amt):
     except:
         return amt
 
-def prepare_symbol(symbol):
-    try:
-        exchange.set_margin_mode('isolated', symbol)
-        exchange.set_leverage(LEVERAGE, symbol)
-    except Exception as e:
-        logging.warning(f"Prepare {symbol} failed: {e}")
-
 # === STATEFUL CONTINUOUS PATTERN DETECTION ===
 def pattern_monitor_loop():
     load_pattern_states()
@@ -189,16 +194,15 @@ def pattern_monitor_loop():
         try:
             now_ms = int(time.time() * 1000)
 
-            # Process in small batches to keep CPU low
-            symbols = get_symbols()
-            batch_size = 30  # small batch = low CPU
+            # Process in small batches to keep CPU very low
+            symbols = get_symbols()  # <--- This line was missing in the previous snippet
+            batch_size = 30
             for start in range(0, len(symbols), batch_size):
                 batch = symbols[start:start+batch_size]
 
                 for symbol in batch:
                     state = pattern_states.get(symbol, {'stage': 0})
 
-                    # Fetch last 6 closed candles
                     try:
                         candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)
                         if len(candles) < 6:
@@ -208,20 +212,17 @@ def pattern_monitor_loop():
 
                     latest_closed = candles[-1]
 
-                    # Skip if no new candle since last check
                     if latest_closed[0] <= state.get('last_checked', 0):
                         continue
 
                     state['last_checked'] = latest_closed[0]
 
-                    # Pattern progress
                     if state['stage'] == 0:
-                        # Look for big candle in recent past (candles[-3] or [-4])
                         if is_big_candle(candles[-3]):
                             state['stage'] = 1
                             state['big_ts'] = candles[-3][0]
                             state['big_data'] = candles[-3]
-                            logging.info(f"{symbol} → Stage 1: big candle")
+                            logging.info(f"{symbol} → Stage 1: big candle detected")
                             pattern_states[symbol] = state
                             save_pattern_states()
 
@@ -242,7 +243,6 @@ def pattern_monitor_loop():
                                 side = 'buy' if is_bullish(state['big_data']) else 'sell'
                                 logging.info(f"{symbol} → PATTERN COMPLETE → ENTRY {side}")
 
-                                # Trigger trade
                                 try:
                                     prepare_symbol(symbol)
                                     ticker = exchange.fetch_ticker(symbol)
@@ -301,16 +301,15 @@ def pattern_monitor_loop():
                             pattern_states.pop(symbol, None)
                             save_pattern_states()
 
-                time.sleep(2.0)  # gentle pause between batches
+                time.sleep(2.0)  # gentle pause
 
-            # Overall loop pace — check every ~8 seconds
-            time.sleep(8)
+            time.sleep(8)  # overall check frequency
 
         except Exception as e:
             logging.error(f"Monitor error: {e}")
             time.sleep(30)
 
-# Helpers
+# Helpers (add these if missing)
 def is_big_candle(c):
     return body_pct(c) >= MIN_BIG_BODY_PCT
 
@@ -336,7 +335,6 @@ def run_bot():
     )
     send_telegram(startup)
 
-    # Start continuous pattern watcher
     threading.Thread(target=pattern_monitor_loop, daemon=True).start()
 
     app.run(host='0.0.0.0', port=8080, debug=False)

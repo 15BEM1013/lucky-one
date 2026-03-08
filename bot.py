@@ -23,12 +23,12 @@ TIMEFRAME        = '15m'
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
-MAX_WORKERS      = 5
-BATCH_DELAY      = 2.0
-NUM_CHUNKS       = 8
+MAX_WORKERS      = 3                  # ↓ reduced from 5
+BATCH_DELAY      = 4.0                # ↑ increased from 2.0
+NUM_CHUNKS       = 10                 # slightly more chunks for better distribution
 
-CAPITAL_INITIAL   = 10.0       # first entry margin USDT
-CAPITAL_DCA       = 20.0       # DCA add margin
+CAPITAL_INITIAL   = 10.0
+CAPITAL_DCA       = 20.0
 MAX_MARGIN_PER_TRADE = 30.0
 
 LEVERAGE         = 5
@@ -36,7 +36,7 @@ TP_INITIAL_PCT   = 1.0 / 100
 TP_AFTER_DCA_PCT = 0.5 / 100
 DCA_TRIGGER_PCT  = 2.0 / 100
 
-TP_CHECK_INTERVAL = 8          # seconds
+TP_CHECK_INTERVAL = 8
 
 MAX_OPEN_TRADES  = 5
 TRADE_FILE       = 'open_trades.json'
@@ -47,9 +47,8 @@ API_SECRET = os.getenv('BINANCE_SECRET')
 if not API_KEY or not API_SECRET:
     raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
 
-PROXY_LIST = []  # add if needed
+PROXY_LIST = []
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 trade_lock = threading.Lock()
@@ -136,7 +135,6 @@ def initialize_exchange():
         except Exception as e:
             logging.warning(f"Proxy failed: {e}")
 
-    # fallback no proxy
     ex = ccxt.binance({
         'apiKey': API_KEY, 'secret': API_SECRET,
         'options': {'defaultType': 'future', 'marginMode': 'isolated'},
@@ -150,7 +148,7 @@ app = Flask(__name__)
 exchange = initialize_exchange()
 
 sent_signals = {}
-open_trades = {}   # {symbol: { 'side', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_done', 'msg_id_initial', 'msg_id_dca', ... }}
+open_trades = {}
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -229,19 +227,29 @@ def get_avg_entry_and_total(trade):
         return 0.0, 0.0
     return weighted / total_pos, total_pos
 
-# === MONITOR TP + DCA (internal only) ===
+# === MONITOR TP + DCA (websocket priority + stale fallback) ===
 def monitor_tp_and_dca():
-    prices_cache = {}
+    prices_cache = {}           # symbol → price
+    last_fresh_time = {}        # symbol → last update timestamp
 
     def update_prices_ws():
         while True:
             try:
-                for sym in list(open_trades):
-                    ticker = exchange.watch_ticker(sym)
-                    prices_cache[sym] = ticker.get('last') or ticker.get('close')
+                active_symbols = list(open_trades.keys())
+                if not active_symbols:
+                    time.sleep(12)
+                    continue
+
+                tickers = exchange.watch_tickers(active_symbols)
+                now = time.time()
+                for sym, ticker in tickers.items():
+                    price = ticker.get('last') or ticker.get('close') or ticker.get('markPrice')
+                    if price:
+                        prices_cache[sym] = price
+                        last_fresh_time[sym] = now
             except Exception as e:
-                logging.debug(f"WS error: {e}")
-                time.sleep(3)
+                logging.debug(f"WS error (retrying): {e}")
+                time.sleep(5)
 
     threading.Thread(target=update_prices_ws, daemon=True).start()
 
@@ -249,26 +257,32 @@ def monitor_tp_and_dca():
         try:
             with trade_lock:
                 for sym, tr in list(open_trades.items()):
-                    # Get current price
                     current = prices_cache.get(sym)
-                    if not current:
+                    last_time = last_fresh_time.get(sym, 0)
+
+                    # If websocket data is stale (>12s), fallback to REST once
+                    if current is None or (time.time() - last_time) > 12:
                         try:
                             t = exchange.fetch_ticker(sym)
                             current = t.get('last') or t.get('markPrice')
                             prices_cache[sym] = current
+                            last_fresh_time[sym] = time.time()
                         except:
                             continue
 
+                    if current is None:
+                        continue
+
                     is_long = tr['side'] == 'buy'
 
-                    # 1. Check for DCA (only once)
+                    # DCA check (only once)
                     if not tr['dca_done']:
                         trigger_level = tr['avg_entry'] * (1 - DCA_TRIGGER_PCT) if is_long else tr['avg_entry'] * (1 + DCA_TRIGGER_PCT)
                         if (is_long and current <= trigger_level) or (not is_long and current >= trigger_level):
                             try:
                                 used_margin = sum(e['margin'] for e in tr['entries'])
                                 if used_margin + CAPITAL_DCA > MAX_MARGIN_PER_TRADE:
-                                    logging.warning(f"{sym} DCA skipped - margin limit reached")
+                                    logging.warning(f"{sym} DCA skipped - margin limit")
                                     continue
 
                                 dca_amount_raw = (CAPITAL_DCA * LEVERAGE) / current
@@ -280,7 +294,6 @@ def monitor_tp_and_dca():
                                 dca_price = dca_order.get('average') or current
                                 dca_price = round_price(sym, dca_price)
 
-                                # Update trade
                                 tr['entries'].append({
                                     'price': dca_price,
                                     'amount': dca_amount,
@@ -291,7 +304,6 @@ def monitor_tp_and_dca():
                                 tr['avg_entry'], _ = get_avg_entry_and_total(tr)
                                 tr['dca_done'] = True
 
-                                # Update TP to 0.5%
                                 tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA_PCT))
 
                                 dca_msg = (
@@ -310,7 +322,7 @@ def monitor_tp_and_dca():
                             except Exception as e:
                                 logging.error(f"DCA failed for {sym}: {e}")
 
-                    # 2. Check TP
+                    # TP check
                     hit_tp = (is_long and current >= tr['tp']) or (not is_long and current <= tr['tp'])
                     if hit_tp:
                         try:
@@ -365,10 +377,12 @@ def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             time.sleep(30)
 
-# === PROCESS SYMBOL ===
+# === PROCESS SYMBOL (with micro-pauses) ===
 def process_symbol(symbol, alert_queue):
     try:
-        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=10)
+        candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=6)  # ← changed to 6
+        time.sleep(0.12)  # micro-pause after OHLCV fetch
+
         if len(candles) < 6:
             return
 
@@ -393,8 +407,11 @@ def process_symbol(symbol, alert_queue):
             return
 
         prepare_symbol(symbol)
+        time.sleep(0.08)  # micro-pause after prepare
 
         ticker = exchange.fetch_ticker(symbol)
+        time.sleep(0.10)  # micro-pause after ticker
+
         entry_price = round_price(symbol, ticker['last'])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
@@ -405,6 +422,8 @@ def process_symbol(symbol, alert_queue):
             return
 
         entry_order = exchange.create_market_order(symbol, side, amount)
+        time.sleep(0.25)  # micro-pause after real order
+
         filled_price = entry_order.get('average') or entry_price
         filled_price = round_price(symbol, filled_price)
 
@@ -455,6 +474,7 @@ def process_batch(symbols_chunk, q):
                 f.result()
             except:
                 pass
+            time.sleep(0.4)  # small breathing pause after each symbol completes
 
 # === SCAN LOOP ===
 def scan_loop():
@@ -517,7 +537,7 @@ def home():
 def run_bot():
     load_trades()
     startup = (
-        f"Bot hhhhhrestarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
+        f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
         f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
         f"Initial: ${CAPITAL_INITIAL} → DCA +${CAPITAL_DCA} (max ${MAX_MARGIN_PER_TRADE})\n"

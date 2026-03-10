@@ -26,7 +26,7 @@ CAPITAL_INITIAL = 15.0      # first entry margin USDT
 CAPITAL_DCA = 30.0          # DCA add margin
 MAX_MARGIN_PER_TRADE = 45.0
 LEVERAGE = 5
-TP_INITIAL_PCT = 1.0 / 100
+TP_INITIAL_PCT = 1.1 / 100   # ← changed to 1.1%
 TP_AFTER_DCA_PCT = 0.6 / 100
 DCA_TRIGGER_PCT = 2.0 / 100
 TP_CHECK_INTERVAL = 8       # seconds
@@ -152,9 +152,12 @@ def is_bearish(c): return c[4] < c[1]
 def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
 
 def lower_wick_pct(c):
-    if is_bearish(c) and (c[1] - c[4]) != 0:
-        return (c[1] - c[3]) / (c[1] - c[4]) * 100
-    return 0
+    o, h, l, cc = c[1], c[2], c[3], c[4]
+    body = abs(cc - o)
+    if body == 0:
+        return 0
+    lower = min(o, cc) - l
+    return (lower / body) * 100
 
 def round_price(symbol, price):
     try:

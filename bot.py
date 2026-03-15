@@ -10,184 +10,240 @@ from datetime import datetime
 import pytz
 import math
 
-# Load ENV
+# ENV
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET")
 
-TIMEFRAMES = ['5m','30m']
+TIMEFRAMES = ["5m","30m"]
+
+LEVERAGE = 7
+
+TP_CHECK_INTERVAL = 2
 
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
 
-BATCH_DELAY = 2.0
-NUM_CHUNKS = 8
-
-CAPITAL_INITIAL = 15.0
-CAPITAL_DCA = 30.0
-MAX_MARGIN_PER_TRADE = 45.0
-
-LEVERAGE = 7
+CAPITAL_INITIAL = 15
+CAPITAL_DCA = 30
 
 TP_INITIAL_PCT = 1.1/100
 TP_AFTER_DCA_PCT = 0.6/100
-DCA_TRIGGER_PCT = 2.0/100
-
-TP_CHECK_INTERVAL = 2
+DCA_TRIGGER_PCT = 2/100
 
 MAX_OPEN_TRADES = 5
 
-TRADE_FILE = "open_trades.json"
-CLOSED_TRADE_FILE = "closed_trades.json"
+NUM_CHUNKS = 8
+BATCH_DELAY = 2
 
-logging.basicConfig(level=logging.INFO,format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-trade_lock = asyncio.Lock()
+exchange=None
+open_trades={}
+sent_signals={}
+trade_lock=asyncio.Lock()
 
-exchange = None
-open_trades = {}
-sent_signals = {}
-
+# TIME
 def get_ist_time():
-    return datetime.now(pytz.timezone('Asia/Kolkata'))
+    return datetime.now(pytz.timezone("Asia/Kolkata"))
 
 # TELEGRAM
 async def send_telegram(msg):
+    url=f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url,data={
+            "chat_id":CHAT_ID,
+            "text":msg
+        }) as resp:
 
-    try:
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url,data={
-                "chat_id":CHAT_ID,
-                "text":msg,
-                "parse_mode":"Markdown"
-            }) as resp:
-
-                r = await resp.json()
-                return r.get("result",{}).get("message_id")
-
-    except Exception as e:
-        logging.error(f"Telegram send error {e}")
-
-async def edit_telegram_message(mid,text):
-
-    if not mid:
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-
-    try:
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url,data={
-                "chat_id":CHAT_ID,
-                "message_id":mid,
-                "text":text,
-                "parse_mode":"Markdown"
-            }) as resp:
-
-                await resp.release()
-
-    except Exception as e:
-        logging.error(f"Telegram edit error {e}")
+            r=await resp.json()
+            return r.get("result",{}).get("message_id")
 
 # EXCHANGE
 async def initialize_exchange():
 
-    ex = ccxt.binance({
+    ex=ccxt.binance({
         "apiKey":API_KEY,
         "secret":API_SECRET,
         "enableRateLimit":True,
         "options":{
-            "defaultType":"future",
-            "marginMode":"isolated"
+            "defaultType":"future"
         }
     })
 
     await ex.load_markets()
 
-    logging.info("Connected to Binance")
+    logging.info("Connected directly")
 
     return ex
 
+# SYMBOLS
 def get_symbols(markets):
 
     return [
         s for s in markets
-        if "USDT" in s and markets[s].get("swap") and markets[s].get("active",True)
+        if "USDT" in s and markets[s].get("swap")
     ]
 
 # HELPERS
-def is_bullish(c): return c[4] > c[1]
-def is_bearish(c): return c[4] < c[1]
+def is_bullish(c): return c[4]>c[1]
+def is_bearish(c): return c[4]<c[1]
 
 def body_pct(c):
     return abs(c[4]-c[1])/c[1]*100 if c[1] else 0
 
 def lower_wick_pct(c):
 
-    o,h,l,c = c[1],c[2],c[3],c[4]
+    o,h,l,c=c[1],c[2],c[3],c[4]
 
-    body = abs(c-o)
+    body=abs(c-o)
 
     if body==0:
         return 0
 
-    lower = min(o,c)-l
+    lower=min(o,c)-l
 
     return (lower/body)*100
 
 # PATTERN
-def detect_rising_three(candles):
+def detect_rising_three(c):
 
-    c2,c1,c0 = candles[-4],candles[-3],candles[-2]
+    c2,c1,c0=c[-4],c[-3],c[-2]
 
-    avg_vol = sum(c[5] for c in candles[-6:-1])/5
+    big_green=is_bullish(c2) and body_pct(c2)>=MIN_BIG_BODY_PCT
 
-    big_green = is_bullish(c2) and body_pct(c2)>=MIN_BIG_BODY_PCT and c2[5]>avg_vol
+    small1=is_bearish(c1) and body_pct(c1)<MAX_SMALL_BODY_PCT
+    small2=is_bearish(c0) and body_pct(c0)<MAX_SMALL_BODY_PCT
 
-    small_red1 = is_bearish(c1) and body_pct(c1)<MAX_SMALL_BODY_PCT and lower_wick_pct(c1)>=MIN_LOWER_WICK_PCT
-    small_red0 = is_bearish(c0) and body_pct(c0)<MAX_SMALL_BODY_PCT and lower_wick_pct(c0)>=MIN_LOWER_WICK_PCT
+    return big_green and small1 and small2
 
-    return big_green and small_red1 and small_red0
+def detect_falling_three(c):
 
-def detect_falling_three(candles):
+    c2,c1,c0=c[-4],c[-3],c[-2]
 
-    c2,c1,c0 = candles[-4],candles[-3],candles[-2]
+    big_red=is_bearish(c2) and body_pct(c2)>=MIN_BIG_BODY_PCT
 
-    avg_vol = sum(c[5] for c in candles[-6:-1])/5
+    small1=is_bullish(c1) and body_pct(c1)<MAX_SMALL_BODY_PCT
+    small2=is_bullish(c0) and body_pct(c0)<MAX_SMALL_BODY_PCT
 
-    big_red = is_bearish(c2) and body_pct(c2)>=MIN_BIG_BODY_PCT and c2[5]>avg_vol
+    return big_red and small1 and small2
 
-    small_green1 = is_bullish(c1) and body_pct(c1)<MAX_SMALL_BODY_PCT and lower_wick_pct(c1)>=MIN_LOWER_WICK_PCT
-    small_green0 = is_bullish(c0) and body_pct(c0)<MAX_SMALL_BODY_PCT and lower_wick_pct(c0)>=MIN_LOWER_WICK_PCT
+# WAIT FOR CANDLE CLOSE
+def seconds_to_next(tf):
 
-    return big_red and small_green1 and small_green0
+    now=get_ist_time()
 
-# TRADE HELPERS
-def get_avg_entry_and_total(trade):
+    if tf=="5m":
 
-    total = 0
-    weighted = 0
+        secs=now.minute*60+now.second
+        return (300-(secs%300))
 
-    for e in trade["entries"]:
-        weighted += e["price"] * e["amount"]
-        total += e["amount"]
+    if tf=="30m":
 
-    if total==0:
-        return 0,0
+        secs=now.minute*60+now.second
+        return (1800-(secs%1800))
 
-    return weighted/total,total
+# PROCESS SYMBOL
+async def process_symbol(symbol,tf):
 
-# MONITOR
-async def monitor_tp_and_dca():
+    try:
+
+        candles=await exchange.fetch_ohlcv(symbol,tf,limit=6)
+
+        signal_time=candles[-1][0]
+
+        async with trade_lock:
+
+            if len(open_trades)>=MAX_OPEN_TRADES:
+                return
+
+            if sent_signals.get((symbol,tf))==signal_time:
+                return
+
+        side=None
+
+        if detect_rising_three(candles):
+            side="buy"
+
+        elif detect_falling_three(candles):
+            side="sell"
+
+        else:
+            return
+
+        ticker=await exchange.fetch_ticker(symbol)
+
+        entry=ticker["last"]
+
+        amount=(CAPITAL_INITIAL*LEVERAGE)/entry
+
+        order=await exchange.create_market_order(symbol,side,amount)
+
+        filled=order.get("average") or entry
+
+        tp=filled*(1+TP_INITIAL_PCT) if side=="buy" else filled*(1-TP_INITIAL_PCT)
+
+        msg=(
+            f"ENTRY {symbol}\n"
+            f"Side {side}\n"
+            f"TF {tf}\n"
+            f"Entry {filled}\n"
+            f"TP {tp}"
+        )
+
+        mid=await send_telegram(msg)
+
+        async with trade_lock:
+
+            open_trades[symbol]={
+                "side":side,
+                "avg_entry":filled,
+                "tp":tp,
+                "total_amount":amount,
+                "dca_done":False,
+                "msg_id":mid
+            }
+
+            sent_signals[(symbol,tf)]=signal_time
+
+    except Exception as e:
+        logging.error(e)
+
+# BATCH
+async def process_batch(symbols,tf):
+
+    tasks=[asyncio.create_task(process_symbol(s,tf)) for s in symbols]
+
+    await asyncio.gather(*tasks,return_exceptions=True)
+
+# SCAN LOOP
+async def scan_loop(symbols,tf):
+
+    while True:
+
+        wait=seconds_to_next(tf)
+
+        logging.info(f"Next {tf} close in ~{round(wait/60,1)} min")
+
+        await asyncio.sleep(wait)
+
+        chunk_size=math.ceil(len(symbols)/NUM_CHUNKS)
+
+        chunks=[symbols[i:i+chunk_size] for i in range(0,len(symbols),chunk_size)]
+
+        for chunk in chunks:
+
+            await process_batch(chunk,tf)
+
+            await asyncio.sleep(BATCH_DELAY)
+
+# TP MONITOR
+async def monitor_tp():
 
     while True:
 
@@ -199,183 +255,60 @@ async def monitor_tp_and_dca():
                     await asyncio.sleep(TP_CHECK_INTERVAL)
                     continue
 
-                tickers = await exchange.fetch_tickers(list(open_trades.keys()))
+                tickers=await exchange.fetch_tickers(list(open_trades.keys()))
 
                 for sym in list(open_trades):
 
-                    tr = open_trades[sym]
-                    current = tickers[sym]["last"]
+                    tr=open_trades[sym]
 
-                    is_long = tr["side"] == "buy"
+                    price=tickers[sym]["last"]
 
-                    # DCA
-                    if not tr["dca_done"]:
+                    is_long=tr["side"]=="buy"
 
-                        trigger = tr["avg_entry"]*(1-DCA_TRIGGER_PCT) if is_long else tr["avg_entry"]*(1+DCA_TRIGGER_PCT)
+                    hit=(is_long and price>=tr["tp"]) or (not is_long and price<=tr["tp"])
 
-                        if (is_long and current<=trigger) or (not is_long and current>=trigger):
+                    if hit:
 
-                            dca_amount = (CAPITAL_DCA*LEVERAGE)/current
+                        side="sell" if is_long else "buy"
 
-                            order = await exchange.create_market_order(sym,tr["side"],dca_amount)
+                        await exchange.create_market_order(sym,side,tr["total_amount"])
 
-                            price = order.get("average") or current
-
-                            tr["entries"].append({"price":price,"amount":dca_amount,"margin":CAPITAL_DCA})
-
-                            tr["avg_entry"],_ = get_avg_entry_and_total(tr)
-
-                            tr["dca_done"] = True
-
-                            tr["tp"] = tr["avg_entry"]*(1+TP_AFTER_DCA_PCT) if is_long else tr["avg_entry"]*(1-TP_AFTER_DCA_PCT)
-
-                            await send_telegram(f"⚡ DCA triggered {sym}\nNew avg: {tr['avg_entry']}")
-
-                    # TP
-                    hit_tp = (is_long and current>=tr["tp"]) or (not is_long and current<=tr["tp"])
-
-                    if hit_tp:
-
-                        close_side = "sell" if is_long else "buy"
-
-                        await exchange.create_market_order(sym,close_side,tr["total_amount"])
-
-                        pnl = ((current-tr["avg_entry"])/tr["avg_entry"])*100 if is_long else ((tr["avg_entry"]-current)/tr["avg_entry"])*100
-
-                        pnl *= LEVERAGE
-
-                        await edit_telegram_message(tr["msg_id_initial"],f"✅ TP HIT {sym}\nPnL {pnl:.2f}%")
+                        await send_telegram(f"TP HIT {sym}")
 
                         del open_trades[sym]
 
             await asyncio.sleep(TP_CHECK_INTERVAL)
 
         except Exception as e:
+
             logging.error(e)
+
             await asyncio.sleep(5)
-
-# PROCESS SYMBOL
-async def process_symbol(symbol):
-
-    try:
-
-        for tf in TIMEFRAMES:
-
-            candles = await exchange.fetch_ohlcv(symbol,tf,limit=6)
-
-            if len(candles)<6:
-                continue
-
-            signal_time = candles[-1][0]
-
-            async with trade_lock:
-
-                if len(open_trades)>=MAX_OPEN_TRADES:
-                    return
-
-                if sent_signals.get((symbol,tf,"rising")) == signal_time or sent_signals.get((symbol,tf,"falling")) == signal_time:
-                    continue
-
-            pattern=None
-            side=None
-
-            if detect_rising_three(candles):
-
-                pattern="rising"
-                side="buy"
-                sent_signals[(symbol,tf,"rising")] = signal_time
-
-            elif detect_falling_three(candles):
-
-                pattern="falling"
-                side="sell"
-                sent_signals[(symbol,tf,"falling")] = signal_time
-
-            else:
-                continue
-
-            ticker = await exchange.fetch_ticker(symbol)
-
-            entry = ticker["last"]
-
-            amount = (CAPITAL_INITIAL*LEVERAGE)/entry
-
-            order = await exchange.create_market_order(symbol,side,amount)
-
-            filled = order.get("average") or entry
-
-            tp = filled*(1+TP_INITIAL_PCT) if side=="buy" else filled*(1-TP_INITIAL_PCT)
-
-            msg = (
-                f"📈 ENTRY {symbol}\n"
-                f"Side: {side.upper()}\n"
-                f"TF: {tf}\n"
-                f"Entry: {filled}\n"
-                f"TP: {tp}"
-            )
-
-            mid = await send_telegram(msg)
-
-            async with trade_lock:
-
-                open_trades[symbol] = {
-                    "side":side,
-                    "entries":[{"price":filled,"amount":amount,"margin":CAPITAL_INITIAL}],
-                    "total_amount":amount,
-                    "avg_entry":filled,
-                    "tp":tp,
-                    "dca_done":False,
-                    "msg_id_initial":mid
-                }
-
-            break
-
-    except Exception as e:
-        logging.error(e)
-
-# BATCH
-async def process_batch(chunk):
-
-    tasks = [asyncio.create_task(process_symbol(s)) for s in chunk]
-
-    await asyncio.gather(*tasks,return_exceptions=True)
-
-async def scan_loop(symbols):
-
-    while True:
-
-        chunk_size = math.ceil(len(symbols)/NUM_CHUNKS)
-
-        chunks = [symbols[i:i+chunk_size] for i in range(0,len(symbols),chunk_size)]
-
-        for i,chunk in enumerate(chunks):
-
-            await process_batch(chunk)
-
-            if i < len(chunks)-1:
-                await asyncio.sleep(BATCH_DELAY)
 
 # MAIN
 async def main():
 
     global exchange
 
-    exchange = await initialize_exchange()
+    exchange=await initialize_exchange()
 
-    symbols = get_symbols(exchange.markets)
+    symbols=get_symbols(exchange.markets)
 
     await send_telegram(
-        f"🚀 Trading Bot Started\n"
-        f"Time: {get_ist_time()}\n"
-        f"Symbols: {len(symbols)}\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-        f"TP Check: {TP_CHECK_INTERVAL}s"
+        f"🚀 BOT STARTED\n"
+        f"Symbols {len(symbols)}\n"
+        f"Leverage {LEVERAGE}x\n"
+        f"TFs {', '.join(TIMEFRAMES)}"
     )
 
     await asyncio.gather(
-        scan_loop(symbols),
-        monitor_tp_and_dca()
+
+        scan_loop(symbols,"5m"),
+
+        scan_loop(symbols,"30m"),
+
+        monitor_tp()
+
     )
 
 # START

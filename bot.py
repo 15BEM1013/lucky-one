@@ -26,14 +26,19 @@ NUM_CHUNKS = 8
 CAPITAL_INITIAL = 15.0      # first entry margin USDT
 CAPITAL_DCA1 = 25.0
 CAPITAL_DCA2 = 15.0
-MAX_MARGIN_PER_TRADE = 55.0                 # 15 + 25 + 15
+CAPITAL_DCA3 = 15.0         # New DCA3
+MAX_MARGIN_PER_TRADE = 70.0                 # Updated: 15+25+15+15
 LEVERAGE = 7
 TP_INITIAL_PCT = 1.1 / 100
 TP_AFTER_DCA1_PCT = 0.6 / 100
 TP_AFTER_DCA2_PCT = 0.8 / 100
+# After DCA3: TP = average entry price (breakeven)
+
 DCA1_TRIGGER_PCT = 1.5 / 100
 DCA2_TRIGGER_PCT = 2.5 / 100
-SL_PCT = 6.0 / 100                          # fixed from initial entry
+DCA3_TRIGGER_PCT = 7.0 / 100   # New
+
+SL_PCT = 11.0 / 100            # Changed to 11%
 TP_CHECK_INTERVAL = 2       # seconds
 MAX_OPEN_TRADES = 5
 TRADE_FILE = 'open_trades.json'
@@ -230,7 +235,7 @@ def get_avg_entry_and_total(trade):
         return 0.0, 0.0
     return weighted / total_pos, total_pos
 
-# === MONITOR TP + DCA + SL (async, no WS) ===
+# === MONITOR TP + DCA + SL (Updated with DCA3 & 11% SL) ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -285,7 +290,7 @@ async def monitor_tp_and_dca():
                     is_long = tr['side'] == 'buy'
                     initial_price = tr['initial_price']
 
-                    # SL check (fixed from initial entry)
+                    # SL check (11%)
                     sl_level = initial_price * (1 - SL_PCT) if is_long else initial_price * (1 + SL_PCT)
                     if (is_long and current <= sl_level) or (not is_long and current >= sl_level):
                         try:
@@ -335,6 +340,7 @@ async def monitor_tp_and_dca():
                     # DCA logic
                     trigger1 = initial_price * (1 - DCA1_TRIGGER_PCT) if is_long else initial_price * (1 + DCA1_TRIGGER_PCT)
                     trigger2 = initial_price * (1 - DCA2_TRIGGER_PCT) if is_long else initial_price * (1 + DCA2_TRIGGER_PCT)
+                    trigger3 = initial_price * (1 - DCA3_TRIGGER_PCT) if is_long else initial_price * (1 + DCA3_TRIGGER_PCT)
 
                     if tr['dca_stage'] == 0 and ((is_long and current <= trigger1) or (not is_long and current >= trigger1)):
                         try:
@@ -410,6 +416,46 @@ async def monitor_tp_and_dca():
                             await asyncio.to_thread(save_trades)
                         except Exception as e:
                             logging.error(f"DCA2 failed {sym}: {e}")
+
+                    # DCA3 at 7% - TP becomes breakeven
+                    elif tr['dca_stage'] == 2 and ((is_long and current <= trigger3) or (not is_long and current >= trigger3)):
+                        try:
+                            if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA3 > MAX_MARGIN_PER_TRADE:
+                                continue
+                            amt_raw = (CAPITAL_DCA3 * LEVERAGE) / current
+                            amt = float(round_amount(sym, amt_raw))
+                            if amt <= 0: continue
+
+                            order = await exchange.create_market_order(sym, tr['side'], amt)
+                            price = order.get('average') or current
+                            price = round_price(sym, price)
+
+                            tr['entries'].append({
+                                'price': price,
+                                'amount': amt,
+                                'margin': CAPITAL_DCA3,
+                                'ts': time.time(),
+                                'stage': 3
+                            })
+                            tr['total_amount'] += amt
+                            tr['avg_entry'], _ = get_avg_entry_and_total(tr)
+                            tr['tp'] = round_price(sym, tr['avg_entry'])   # Breakeven
+                            tr['dca_stage'] = 3
+
+                            msg = (
+                                f"**DCA3** {sym}\n"
+                                f"Price: {price:.6f}  Added: {amt:.4f} (${CAPITAL_DCA3})\n"
+                                f"New avg: {tr['avg_entry']:.6f}\n"
+                                f"New TP: {tr['tp']:.6f} (Breakeven)"
+                            )
+                            mid = await send_telegram(msg)
+                            if tr.get('msg_id_dca'):
+                                await edit_telegram_message(tr['msg_id_dca'], msg)
+                            else:
+                                tr['msg_id_dca'] = mid
+                            await asyncio.to_thread(save_trades)
+                        except Exception as e:
+                            logging.error(f"DCA3 failed {sym}: {e}")
 
                     # TP check
                     hit_tp = (is_long and current >= tr['tp']) or (not is_long and current <= tr['tp'])
@@ -519,7 +565,7 @@ async def process_symbol(symbol, timeframe):
         async with trade_lock:
             open_trades[symbol] = {
                 'side': side,
-                'initial_price': filled_price,               # ← added for fixed SL
+                'initial_price': filled_price,               
                 'entries': [{
                     'price': filled_price,
                     'amount': amount,
@@ -530,7 +576,7 @@ async def process_symbol(symbol, timeframe):
                 'total_amount': amount,
                 'avg_entry': filled_price,
                 'tp': tp,
-                'dca_stage': 0,                             # 0 = none, 1 = dca1, 2 = dca2
+                'dca_stage': 0,                             
                 'msg_id_initial': mid,
                 'msg_id_dca': None,
                 'open_ts': time.time()
@@ -606,8 +652,9 @@ async def main():
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
         f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
-        f"Initial: $15 → DCA1 $25 @ -1.5% → DCA2 $15 @ -2.5%\n"
-        f"TP: 1.1% → 0.6% → 0.8% • SL: 6% fixed from entry"
+        f"Initial: $15 → DCA1 $25 @ -1.5% → DCA2 $15 @ -2.5% → DCA3 $15 @ -7%\n"
+        f"TP: 1.1% → 0.6% → 0.8% → Breakeven (DCA3)\n"
+        f"SL: 11% fixed from initial entry"
     )
     await send_telegram(startup)
     tasks = [

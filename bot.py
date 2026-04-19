@@ -16,30 +16,32 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TIMEFRAMES = ['5m', '30m']                  # scan both timeframes
+TIMEFRAMES = ['5m', '30m']                  
 CANDLE_LIMIT = 6
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
-CAPITAL_INITIAL = 15.0      # first entry margin USDT
+
+CAPITAL_INITIAL = 15.0      
 CAPITAL_DCA1 = 25.0
 CAPITAL_DCA2 = 15.0
-CAPITAL_DCA3 = 15.0         # New DCA3
-MAX_MARGIN_PER_TRADE = 70.0                 # Updated: 15+25+15+15
+
+MAX_MARGIN_PER_TRADE = 55.0                 
 LEVERAGE = 7
+
 TP_INITIAL_PCT = 1.1 / 100
 TP_AFTER_DCA1_PCT = 0.6 / 100
 TP_AFTER_DCA2_PCT = 0.8 / 100
-# After DCA3: TP = average entry price (breakeven)
 
-DCA1_TRIGGER_PCT = 1.5 / 100
+DCA1_TRIGGER_PCT = 1.0 / 100      
 DCA2_TRIGGER_PCT = 2.5 / 100
-DCA3_TRIGGER_PCT = 7.0 / 100   # New
 
-SL_PCT = 11.0 / 100            # Changed to 11%
-TP_CHECK_INTERVAL = 2       # seconds
+SL_PCT = 6.0 / 100                
+
+TP_CHECK_INTERVAL = 0.5           
+
 MAX_OPEN_TRADES = 5
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
@@ -49,7 +51,7 @@ API_SECRET = os.getenv('BINANCE_SECRET')
 if not API_KEY or not API_SECRET:
     raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
 
-PROXY_LIST = []  # format: [{"host": "...", "port": "...", "username": "...", "password": "..."}]
+PROXY_LIST = []  
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -90,7 +92,7 @@ def save_closed_trade(closed):
     except Exception as e:
         logging.error(f"Save closed trade error: {e}")
 
-# === TELEGRAM (async) ===
+# === TELEGRAM ===
 async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -141,7 +143,6 @@ async def initialize_exchange():
         except Exception as e:
             logging.warning(f"Proxy failed: {e}")
     
-    # fallback no proxy
     ex = ccxt.binance({
         'apiKey': API_KEY,
         'secret': API_SECRET,
@@ -153,10 +154,25 @@ async def initialize_exchange():
     return ex
 
 exchange = None
-sent_signals = {}  # (symbol, timeframe, 'rising'/'falling') → signal_time
-open_trades = {}   # {symbol: { 'side', 'initial_price', 'entries':[...], 'avg_entry', 'total_amount', 'tp', 'dca_stage', ... }}
+sent_signals = {}  
+open_trades = {}   
 
-# === CANDLE HELPERS ===
+# === HELPERS ===
+def get_ist_time():
+    return datetime.now(pytz.timezone('Asia/Kolkata'))
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    minutes = minutes % 60
+    return f"{hours}h {minutes}m"
+
+# === CANDLE & PATTERN (unchanged) ===
 def is_bullish(c): return c[4] > c[1]
 def is_bearish(c): return c[4] < c[1]
 def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
@@ -164,8 +180,7 @@ def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
 def lower_wick_pct(c):
     o, h, l, cc = c[1], c[2], c[3], c[4]
     body = abs(cc - o)
-    if body == 0:
-        return 0
+    if body == 0: return 0
     lower = min(o, cc) - l
     return (lower / body) * 100
 
@@ -184,7 +199,6 @@ def round_amount(symbol, amt):
     except:
         return amt
 
-# === PATTERN ===
 def detect_rising_three(candles):
     if len(candles) < 6: return False
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
@@ -203,7 +217,6 @@ def detect_falling_three(candles):
     small_green_0 = is_bullish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
     return big_red and small_green_1 and small_green_0
 
-# === SYMBOLS ===
 def get_symbols(markets):
     return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
 
@@ -211,11 +224,9 @@ async def prepare_symbol(symbol):
     try:
         await exchange.set_margin_mode('isolated', symbol)
         await exchange.set_leverage(LEVERAGE, symbol)
-        logging.info(f"Prepared {symbol}: isolated + {LEVERAGE}x")
     except Exception as e:
         logging.warning(f"Prepare {symbol} failed: {e}")
 
-# === NEXT CANDLE ===
 def get_next_candle_close():
     now = get_ist_time()
     secs = now.minute * 60 + now.second
@@ -224,18 +235,41 @@ def get_next_candle_close():
         secs_to += 5 * 60
     return time.time() + secs_to
 
-# === HELPERS ===
 def get_avg_entry_and_total(trade):
-    total_pos = 0.0
-    weighted = 0.0
-    for e in trade['entries']:
-        weighted += e['price'] * e['amount']
-        total_pos += e['amount']
-    if total_pos == 0:
-        return 0.0, 0.0
-    return weighted / total_pos, total_pos
+    total_pos = sum(e['amount'] for e in trade['entries'])
+    weighted = sum(e['price'] * e['amount'] for e in trade['entries'])
+    return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
-# === MONITOR TP + DCA + SL (Updated with DCA3 & 11% SL) ===
+# === BUILD SINGLE TRADE MESSAGE ===
+def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
+    is_long = tr['side'] == 'buy'
+    duration = format_duration(time.time() - tr['open_ts'])
+    tf = tr.get('timeframe', 'N/A')
+    
+    lines = [
+        f"**{'LONG' if is_long else 'SHORT'}** {sym} ({tf})",
+        f"Entry: {tr['initial_price']:.6f} | Avg: {tr['avg_entry']:.6f}",
+        f"Duration: {duration}"
+    ]
+
+    # Show entries
+    entries_str = []
+    for e in tr['entries']:
+        stage = "Initial" if e['stage'] == 0 else f"DCA{e['stage']}"
+        entries_str.append(f"{stage}: {e['price']:.6f} (${e['margin']})")
+    lines.append("Entries: " + " | ".join(entries_str))
+
+    lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
+
+    if is_final and hit_type:
+        lines.append(f"**{hit_type} HIT** | Exit: {exit_price:.6f}")
+        lines.append(f"PnL: {pnl_pct:.2f}% (${pnl_usdt:+.2f})")
+    else:
+        lines.append(f"DCA Stage: {tr['dca_stage']}/2")
+
+    return "\n".join(lines)
+
+# === MONITOR TP + DCA + SL (Single Message + Duration) ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -244,40 +278,34 @@ async def monitor_tp_and_dca():
                 if not open_symbols:
                     await asyncio.sleep(TP_CHECK_INTERVAL)
                     continue
-                # Batch fetch prices
+                
                 prices = {}
                 try:
                     tickers = await exchange.fetch_tickers(open_symbols)
                     for sym, t in tickers.items():
                         prices[sym] = t.get('last') or t.get('close') or t.get('markPrice')
-                except Exception as e:
-                    logging.warning(f"Batch tickers error: {e}")
+                except Exception:
+                    pass
                 
                 for sym in list(open_trades):
                     tr = open_trades[sym]
 
-                    # Sync real position size & avg entry
+                    # Sync position
                     try:
                         pos = await exchange.fetch_position(sym)
                         if not pos or not pos.get('info'):
                             continue
-
                         info = pos['info']
-                        real_amt_str = info.get('positionAmt', '0')
-                        real_amount = abs(float(real_amt_str))
-
+                        real_amount = abs(float(info.get('positionAmt', '0')))
                         if real_amount <= 0:
                             await send_telegram(f"🗑️ Position on {sym} closed externally")
                             del open_trades[sym]
                             await asyncio.to_thread(save_trades)
                             continue
-
-                        real_avg = float(info.get('entryPrice', tr['avg_entry']))
                         tr['total_amount'] = real_amount
-                        tr['avg_entry'] = real_avg
-
-                    except Exception as e:
-                        logging.debug(f"Position sync failed for {sym}: {e}")
+                        tr['avg_entry'] = float(info.get('entryPrice', tr['avg_entry']))
+                    except:
+                        pass
 
                     current = prices.get(sym)
                     if not current:
@@ -290,46 +318,27 @@ async def monitor_tp_and_dca():
                     is_long = tr['side'] == 'buy'
                     initial_price = tr['initial_price']
 
-                    # SL check (11%)
+                    # SL Check
                     sl_level = initial_price * (1 - SL_PCT) if is_long else initial_price * (1 + SL_PCT)
                     if (is_long and current <= sl_level) or (not is_long and current >= sl_level):
                         try:
                             close_side = 'sell' if is_long else 'buy'
-                            close_order = await exchange.create_order(
-                                sym, 'market', close_side, tr['total_amount'],
-                                params={'reduceOnly': True}
-                            )
+                            close_order = await exchange.create_order(sym, 'market', close_side, tr['total_amount'], params={'reduceOnly': True})
                             exit_price = close_order.get('average') or current
                             exit_price = round_price(sym, exit_price)
 
-                            pnl_pct = ((exit_price - tr['avg_entry']) / tr['avg_entry']) * 100 if is_long else \
-                                      ((tr['avg_entry'] - exit_price) / tr['avg_entry']) * 100
+                            pnl_pct = ((exit_price - tr['avg_entry']) / tr['avg_entry']) * 100 if is_long else ((tr['avg_entry'] - exit_price) / tr['avg_entry']) * 100
                             leveraged_pnl = pnl_pct * LEVERAGE
                             total_margin = sum(e['margin'] for e in tr['entries'])
                             profit_usdt = total_margin * (leveraged_pnl / 100)
 
-                            msg = (
-                                f"**STOP-LOSS HIT** {sym} — {'LONG' if is_long else 'SHORT'}\n"
-                                f"Initial: {initial_price:.6f}  Avg: {tr['avg_entry']:.6f}\n"
-                                f"Exit: {exit_price:.6f}\n"
-                                f"Size: {tr['total_amount']:.4f}\n"
-                                f"PnL: {leveraged_pnl:.2f}% (${profit_usdt:+.2f})\n"
-                                f"DCA stage: {tr['dca_stage']}"
-                            )
-                            await edit_telegram_message(tr['msg_id_initial'], msg)
-                            if tr.get('msg_id_dca'):
-                                await edit_telegram_message(tr['msg_id_dca'], "Position closed on SL ↓")
+                            final_msg = build_trade_message(tr, sym, is_final=True, hit_type="STOP-LOSS", exit_price=exit_price, pnl_usdt=profit_usdt, pnl_pct=leveraged_pnl)
+                            await edit_telegram_message(tr['msg_id_initial'], final_msg)
 
                             await asyncio.to_thread(save_closed_trade, {
-                                'symbol': sym,
-                                'pnl_usdt': profit_usdt,
-                                'pnl_pct': leveraged_pnl,
-                                'hit': 'SL',
-                                'avg_entry': tr['avg_entry'],
-                                'exit': exit_price,
-                                'dca_stage': tr['dca_stage'],
-                                'total_margin': total_margin,
-                                'ts': time.time()
+                                'symbol': sym, 'pnl_usdt': profit_usdt, 'pnl_pct': leveraged_pnl,
+                                'hit': 'SL', 'avg_entry': tr['avg_entry'], 'exit': exit_price,
+                                'dca_stage': tr['dca_stage'], 'total_margin': total_margin, 'ts': time.time()
                             })
                             del open_trades[sym]
                             await asyncio.to_thread(save_trades)
@@ -337,166 +346,73 @@ async def monitor_tp_and_dca():
                         except Exception as e:
                             logging.error(f"SL close failed {sym}: {e}")
 
-                    # DCA logic
+                    # DCA Logic (Only edit message, no new message)
                     trigger1 = initial_price * (1 - DCA1_TRIGGER_PCT) if is_long else initial_price * (1 + DCA1_TRIGGER_PCT)
                     trigger2 = initial_price * (1 - DCA2_TRIGGER_PCT) if is_long else initial_price * (1 + DCA2_TRIGGER_PCT)
-                    trigger3 = initial_price * (1 - DCA3_TRIGGER_PCT) if is_long else initial_price * (1 + DCA3_TRIGGER_PCT)
 
+                    updated = False
                     if tr['dca_stage'] == 0 and ((is_long and current <= trigger1) or (not is_long and current >= trigger1)):
-                        try:
-                            if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA1 > MAX_MARGIN_PER_TRADE:
-                                continue
-                            amt_raw = (CAPITAL_DCA1 * LEVERAGE) / current
-                            amt = float(round_amount(sym, amt_raw))
-                            if amt <= 0: continue
+                        if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA1 <= MAX_MARGIN_PER_TRADE:
+                            try:
+                                amt_raw = (CAPITAL_DCA1 * LEVERAGE) / current
+                                amt = float(round_amount(sym, amt_raw))
+                                if amt > 0:
+                                    order = await exchange.create_market_order(sym, tr['side'], amt)
+                                    price = round_price(sym, order.get('average') or current)
 
-                            order = await exchange.create_market_order(sym, tr['side'], amt)
-                            price = order.get('average') or current
-                            price = round_price(sym, price)
-
-                            tr['entries'].append({
-                                'price': price,
-                                'amount': amt,
-                                'margin': CAPITAL_DCA1,
-                                'ts': time.time(),
-                                'stage': 1
-                            })
-                            tr['total_amount'] += amt
-                            tr['avg_entry'], _ = get_avg_entry_and_total(tr)
-                            tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA1_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA1_PCT))
-                            tr['dca_stage'] = 1
-
-                            msg = (
-                                f"**DCA1** {sym}\n"
-                                f"Price: {price:.6f}  Added: {amt:.4f} (${CAPITAL_DCA1})\n"
-                                f"New avg: {tr['avg_entry']:.6f}\n"
-                                f"New TP: {tr['tp']:.6f} ({TP_AFTER_DCA1_PCT*100:.1f}%)"
-                            )
-                            mid = await send_telegram(msg)
-                            tr['msg_id_dca'] = mid
-                            await asyncio.to_thread(save_trades)
-                        except Exception as e:
-                            logging.error(f"DCA1 failed {sym}: {e}")
+                                    tr['entries'].append({'price': price, 'amount': amt, 'margin': CAPITAL_DCA1, 'ts': time.time(), 'stage': 1})
+                                    tr['total_amount'] += amt
+                                    tr['avg_entry'], _ = get_avg_entry_and_total(tr)
+                                    tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA1_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA1_PCT))
+                                    tr['dca_stage'] = 1
+                                    updated = True
+                            except Exception as e:
+                                logging.error(f"DCA1 failed {sym}: {e}")
 
                     elif tr['dca_stage'] == 1 and ((is_long and current <= trigger2) or (not is_long and current >= trigger2)):
-                        try:
-                            if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA2 > MAX_MARGIN_PER_TRADE:
-                                continue
-                            amt_raw = (CAPITAL_DCA2 * LEVERAGE) / current
-                            amt = float(round_amount(sym, amt_raw))
-                            if amt <= 0: continue
+                        if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA2 <= MAX_MARGIN_PER_TRADE:
+                            try:
+                                amt_raw = (CAPITAL_DCA2 * LEVERAGE) / current
+                                amt = float(round_amount(sym, amt_raw))
+                                if amt > 0:
+                                    order = await exchange.create_market_order(sym, tr['side'], amt)
+                                    price = round_price(sym, order.get('average') or current)
 
-                            order = await exchange.create_market_order(sym, tr['side'], amt)
-                            price = order.get('average') or current
-                            price = round_price(sym, price)
+                                    tr['entries'].append({'price': price, 'amount': amt, 'margin': CAPITAL_DCA2, 'ts': time.time(), 'stage': 2})
+                                    tr['total_amount'] += amt
+                                    tr['avg_entry'], _ = get_avg_entry_and_total(tr)
+                                    tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA2_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA2_PCT))
+                                    tr['dca_stage'] = 2
+                                    updated = True
+                            except Exception as e:
+                                logging.error(f"DCA2 failed {sym}: {e}")
 
-                            tr['entries'].append({
-                                'price': price,
-                                'amount': amt,
-                                'margin': CAPITAL_DCA2,
-                                'ts': time.time(),
-                                'stage': 2
-                            })
-                            tr['total_amount'] += amt
-                            tr['avg_entry'], _ = get_avg_entry_and_total(tr)
-                            tr['tp'] = round_price(sym, tr['avg_entry'] * (1 + TP_AFTER_DCA2_PCT) if is_long else tr['avg_entry'] * (1 - TP_AFTER_DCA2_PCT))
-                            tr['dca_stage'] = 2
+                    if updated:
+                        new_msg = build_trade_message(tr, sym)
+                        await edit_telegram_message(tr['msg_id_initial'], new_msg)
+                        await asyncio.to_thread(save_trades)
 
-                            msg = (
-                                f"**DCA2** {sym}\n"
-                                f"Price: {price:.6f}  Added: {amt:.4f} (${CAPITAL_DCA2})\n"
-                                f"New avg: {tr['avg_entry']:.6f}\n"
-                                f"New TP: {tr['tp']:.6f} ({TP_AFTER_DCA2_PCT*100:.1f}%)"
-                            )
-                            mid = await send_telegram(msg)
-                            if tr.get('msg_id_dca'):
-                                await edit_telegram_message(tr['msg_id_dca'], msg)
-                            else:
-                                tr['msg_id_dca'] = mid
-                            await asyncio.to_thread(save_trades)
-                        except Exception as e:
-                            logging.error(f"DCA2 failed {sym}: {e}")
-
-                    # DCA3 at 7% - TP becomes breakeven
-                    elif tr['dca_stage'] == 2 and ((is_long and current <= trigger3) or (not is_long and current >= trigger3)):
-                        try:
-                            if sum(e['margin'] for e in tr['entries']) + CAPITAL_DCA3 > MAX_MARGIN_PER_TRADE:
-                                continue
-                            amt_raw = (CAPITAL_DCA3 * LEVERAGE) / current
-                            amt = float(round_amount(sym, amt_raw))
-                            if amt <= 0: continue
-
-                            order = await exchange.create_market_order(sym, tr['side'], amt)
-                            price = order.get('average') or current
-                            price = round_price(sym, price)
-
-                            tr['entries'].append({
-                                'price': price,
-                                'amount': amt,
-                                'margin': CAPITAL_DCA3,
-                                'ts': time.time(),
-                                'stage': 3
-                            })
-                            tr['total_amount'] += amt
-                            tr['avg_entry'], _ = get_avg_entry_and_total(tr)
-                            tr['tp'] = round_price(sym, tr['avg_entry'])   # Breakeven
-                            tr['dca_stage'] = 3
-
-                            msg = (
-                                f"**DCA3** {sym}\n"
-                                f"Price: {price:.6f}  Added: {amt:.4f} (${CAPITAL_DCA3})\n"
-                                f"New avg: {tr['avg_entry']:.6f}\n"
-                                f"New TP: {tr['tp']:.6f} (Breakeven)"
-                            )
-                            mid = await send_telegram(msg)
-                            if tr.get('msg_id_dca'):
-                                await edit_telegram_message(tr['msg_id_dca'], msg)
-                            else:
-                                tr['msg_id_dca'] = mid
-                            await asyncio.to_thread(save_trades)
-                        except Exception as e:
-                            logging.error(f"DCA3 failed {sym}: {e}")
-
-                    # TP check
+                    # TP Check
                     hit_tp = (is_long and current >= tr['tp']) or (not is_long and current <= tr['tp'])
                     if hit_tp:
                         try:
                             close_side = 'sell' if is_long else 'buy'
-                            close_order = await exchange.create_order(
-                                sym, 'market', close_side, tr['total_amount'],
-                                params={'reduceOnly': True}
-                            )
+                            close_order = await exchange.create_order(sym, 'market', close_side, tr['total_amount'], params={'reduceOnly': True})
                             exit_price = close_order.get('average') or current
                             exit_price = round_price(sym, exit_price)
 
-                            pnl_pct = ((exit_price - tr['avg_entry']) / tr['avg_entry']) * 100 if is_long else \
-                                      ((tr['avg_entry'] - exit_price) / tr['avg_entry']) * 100
+                            pnl_pct = ((exit_price - tr['avg_entry']) / tr['avg_entry']) * 100 if is_long else ((tr['avg_entry'] - exit_price) / tr['avg_entry']) * 100
                             leveraged_pnl = pnl_pct * LEVERAGE
                             total_margin = sum(e['margin'] for e in tr['entries'])
                             profit_usdt = total_margin * (leveraged_pnl / 100)
 
-                            msg = (
-                                f"**TP HIT** {sym} — {'LONG' if is_long else 'SHORT'}\n"
-                                f"Avg entry: {tr['avg_entry']:.6f}\n"
-                                f"Exit: {exit_price:.6f}\n"
-                                f"Size: {tr['total_amount']:.4f}\n"
-                                f"PnL: {leveraged_pnl:.2f}% (${profit_usdt:+.2f})\n"
-                                f"DCA stage: {tr['dca_stage']}"
-                            )
-                            await edit_telegram_message(tr['msg_id_initial'], msg)
-                            if tr.get('msg_id_dca'):
-                                await edit_telegram_message(tr['msg_id_dca'], "Position closed on TP ↑")
+                            final_msg = build_trade_message(tr, sym, is_final=True, hit_type="TP", exit_price=exit_price, pnl_usdt=profit_usdt, pnl_pct=leveraged_pnl)
+                            await edit_telegram_message(tr['msg_id_initial'], final_msg)
 
                             await asyncio.to_thread(save_closed_trade, {
-                                'symbol': sym,
-                                'pnl_usdt': profit_usdt,
-                                'pnl_pct': leveraged_pnl,
-                                'hit': 'TP',
-                                'avg_entry': tr['avg_entry'],
-                                'exit': exit_price,
-                                'dca_stage': tr['dca_stage'],
-                                'total_margin': total_margin,
-                                'ts': time.time()
+                                'symbol': sym, 'pnl_usdt': profit_usdt, 'pnl_pct': leveraged_pnl,
+                                'hit': 'TP', 'avg_entry': tr['avg_entry'], 'exit': exit_price,
+                                'dca_stage': tr['dca_stage'], 'total_margin': total_margin, 'ts': time.time()
                             })
                             del open_trades[sym]
                             await asyncio.to_thread(save_trades)
@@ -506,9 +422,9 @@ async def monitor_tp_and_dca():
             await asyncio.sleep(TP_CHECK_INTERVAL)
         except Exception as e:
             logging.error(f"Monitor loop error: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(1)
 
-# === PROCESS SYMBOL ===
+# === PROCESS SYMBOL (Create Single Message with Timeframe) ===
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
@@ -522,8 +438,7 @@ async def process_symbol(symbol, timeframe):
         async with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
                 return
-            if sent_signals.get(key_rising) == signal_time or \
-               sent_signals.get(key_falling) == signal_time:
+            if sent_signals.get(key_rising) == signal_time or sent_signals.get(key_falling) == signal_time:
                 return
 
         pattern = None
@@ -543,59 +458,45 @@ async def process_symbol(symbol, timeframe):
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = float(round_amount(symbol, amount_raw))
         if amount <= 0:
-            logging.warning(f"Amount too small for {symbol} on {timeframe}")
             return
 
         entry_order = await exchange.create_market_order(symbol, side, amount)
-        filled_price = entry_order.get('average') or entry_price
-        filled_price = round_price(symbol, filled_price)
+        filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
         tp = round_price(symbol, filled_price * (1 + TP_INITIAL_PCT) if side == 'buy' else filled_price * (1 - TP_INITIAL_PCT))
 
-        entry_msg = (
-            f"**ENTRY** {symbol} — {'LONG' if side=='buy' else 'SHORT'} ({timeframe.upper()})\n"
-            f"Entry: {filled_price:.6f}\n"
-            f"Pattern: {pattern}\n"
-            f"Size: {amount:.4f} (${CAPITAL_INITIAL:.0f})\n"
-            f"TP: {tp:.6f} ({TP_INITIAL_PCT*100:.1f}%)\n"
-            f"SL: {SL_PCT*100:.1f}% fixed • DCA possible"
-        )
-        mid = await send_telegram(entry_msg)
+        # Create initial message
+        initial_trade = {
+            'side': side,
+            'initial_price': filled_price,
+            'entries': [{'price': filled_price, 'amount': amount, 'margin': CAPITAL_INITIAL, 'ts': time.time(), 'stage': 0}],
+            'total_amount': amount,
+            'avg_entry': filled_price,
+            'tp': tp,
+            'dca_stage': 0,
+            'msg_id_initial': None,
+            'open_ts': time.time(),
+            'timeframe': timeframe   # Save timeframe for later use
+        }
+
+        msg_text = build_trade_message(initial_trade, symbol)
+        mid = await send_telegram(msg_text)
+        initial_trade['msg_id_initial'] = mid
 
         async with trade_lock:
-            open_trades[symbol] = {
-                'side': side,
-                'initial_price': filled_price,               
-                'entries': [{
-                    'price': filled_price,
-                    'amount': amount,
-                    'margin': CAPITAL_INITIAL,
-                    'ts': time.time(),
-                    'stage': 0
-                }],
-                'total_amount': amount,
-                'avg_entry': filled_price,
-                'tp': tp,
-                'dca_stage': 0,                             
-                'msg_id_initial': mid,
-                'msg_id_dca': None,
-                'open_ts': time.time()
-            }
+            open_trades[symbol] = initial_trade
             await asyncio.to_thread(save_trades)
 
         logging.info(f"Opened {side} {symbol} @ {filled_price} on {timeframe}")
 
-    except ccxt.InsufficientFunds:
-        logging.error(f"Insufficient funds {symbol} on {timeframe}")
     except Exception as e:
-        logging.error(f"Trade failed {symbol} on {timeframe}: {str(e)}")
+        logging.error(f"Trade failed {symbol} on {timeframe}: {e}")
 
-# === BATCH ===
+# === BATCH, SCAN, DAILY SUMMARY, MAIN (unchanged except small fixes) ===
 async def process_batch(symbols_chunk, timeframe):
     tasks = [asyncio.create_task(process_symbol(s, timeframe)) for s in symbols_chunk]
     await asyncio.gather(*tasks, return_exceptions=True)
 
-# === SCAN LOOP ===
 async def scan_loop(symbols):
     while True:
         wait_until = get_next_candle_close()
@@ -613,10 +514,8 @@ async def scan_loop(symbols):
                 if i < len(chunks)-1:
                     await asyncio.sleep(BATCH_DELAY)
             await asyncio.sleep(1.0)
-
         logging.info("Full multi-timeframe scan completed")
 
-# === DAILY SUMMARY ===
 async def daily_summary():
     while True:
         await asyncio.sleep(86400)
@@ -630,17 +529,11 @@ async def daily_summary():
             bal = await exchange.fetch_balance()
             usdt = bal.get('USDT', {})
             total = usdt.get('free', 0) + usdt.get('used', 0)
-            msg = (
-                f"📊 *Daily Summary*\n"
-                f"All-time PnL: $ {total_pnl:.2f} (${total_pct:.2f}%)\n"
-                f"Open positions: {len(open_trades)}\n"
-                f"Total USDT: ${total:.2f}"
-            )
+            msg = f"📊 *Daily Summary*\nAll-time PnL: $ {total_pnl:.2f} (${total_pct:.2f}%)\nOpen positions: {len(open_trades)}\nTotal USDT: ${total:.2f}"
             await send_telegram(msg)
         except Exception as e:
             logging.error(f"Daily summary error: {e}")
 
-# === MAIN ===
 async def main():
     global exchange
     exchange = await initialize_exchange()
@@ -648,15 +541,17 @@ async def main():
     symbols = get_symbols(markets)
     load_trades()
     logging.info(f"Scanning {len(symbols)} USDT perpetuals")
+    
     startup = (
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Open positions: {len(open_trades)}\n"
         f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
-        f"Initial: $15 → DCA1 $25 @ -1.5% → DCA2 $15 @ -2.5% → DCA3 $15 @ -7%\n"
-        f"TP: 1.1% → 0.6% → 0.8% → Breakeven (DCA3)\n"
-        f"SL: 11% fixed from initial entry"
+        f"Initial: $15 → DCA1 $25 @ -1% → DCA2 $15 @ -2.5%\n"
+        f"TP: 1.1% → 0.6% → 0.8%\n"
+        f"SL: 6% fixed • Single updating message"
     )
     await send_telegram(startup)
+    
     tasks = [
         asyncio.create_task(scan_loop(symbols)),
         asyncio.create_task(monitor_tp_and_dca()),

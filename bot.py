@@ -18,7 +18,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAMES = ['5m', '30m']                  
 CANDLE_LIMIT = 6
-MIN_BIG_BODY_PCT = 1.0
+MIN_BIG_BODY_PCT = 1.0          # Kept as requested
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
 BATCH_DELAY = 2.0
@@ -142,7 +142,7 @@ async def initialize_exchange():
             return ex
         except Exception as e:
             logging.warning(f"Proxy failed: {e}")
-    
+
     ex = ccxt.binance({
         'apiKey': API_KEY,
         'secret': API_SECRET,
@@ -158,9 +158,6 @@ sent_signals = {}
 open_trades = {}   
 
 # === HELPERS ===
-def get_ist_time():
-    return datetime.now(pytz.timezone('Asia/Kolkata'))
-
 def format_duration(seconds):
     if seconds < 60:
         return f"{int(seconds)}s"
@@ -172,7 +169,7 @@ def format_duration(seconds):
     minutes = minutes % 60
     return f"{hours}h {minutes}m"
 
-# === CANDLE & PATTERN (unchanged) ===
+# === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
 def is_bearish(c): return c[4] < c[1]
 def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
@@ -183,6 +180,36 @@ def lower_wick_pct(c):
     if body == 0: return 0
     lower = min(o, cc) - l
     return (lower / body) * 100
+
+def upper_wick_pct(c):
+    o, h, l, cc = c[1], c[2], c[3], c[4]
+    body = abs(cc - o)
+    if body == 0: return 0
+    upper = h - max(o, cc)
+    return (upper / body) * 100
+
+def get_wick_signal(candle):
+    if body_pct(candle) < 0.5:
+        return None, None
+
+    upper = upper_wick_pct(candle)
+    lower = lower_wick_pct(candle)
+    is_green = is_bullish(candle)
+
+    if is_green:
+        if upper > 40 or (upper > 30 and lower > 30):
+            reason = f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL** (Rejection)"
+            return 'sell', reason
+        else:
+            reason = f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY** (Strong Bullish)"
+            return 'buy', reason
+    else:  # Red Candle
+        if lower > 30 or (upper > 30 and lower > 30):
+            reason = f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY** (Rejection)"
+            return 'buy', reason
+        else:
+            reason = f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL** (Bearish Continuation)"
+            return 'sell', reason
 
 def round_price(symbol, price):
     try:
@@ -199,23 +226,24 @@ def round_amount(symbol, amt):
     except:
         return amt
 
+# === PATTERN DETECTION ===
 def detect_rising_three(candles):
-    if len(candles) < 6: return False
+    if len(candles) < 6: return False, None
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
     avg_vol = sum(c[5] for c in candles[-6:-1]) / 5
     big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_vol
     small_red_1 = is_bearish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
     small_red_0 = is_bearish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
-    return big_green and small_red_1 and small_red_0
+    return big_green and small_red_1 and small_red_0, c2
 
 def detect_falling_three(candles):
-    if len(candles) < 6: return False
+    if len(candles) < 6: return False, None
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
     avg_vol = sum(c[5] for c in candles[-6:-1]) / 5
     big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_vol
     small_green_1 = is_bullish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
     small_green_0 = is_bullish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
-    return big_red and small_green_1 and small_green_0
+    return big_red and small_green_1 and small_green_0, c2
 
 def get_symbols(markets):
     return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
@@ -240,19 +268,18 @@ def get_avg_entry_and_total(trade):
     weighted = sum(e['price'] * e['amount'] for e in trade['entries'])
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
-# === BUILD SINGLE TRADE MESSAGE ===
+# === BUILD TRADE MESSAGE ===
 def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
     is_long = tr['side'] == 'buy'
     duration = format_duration(time.time() - tr['open_ts'])
     tf = tr.get('timeframe', 'N/A')
-    
+
     lines = [
         f"**{'LONG' if is_long else 'SHORT'}** {sym} ({tf})",
         f"Entry: {tr['initial_price']:.6f} | Avg: {tr['avg_entry']:.6f}",
         f"Duration: {duration}"
     ]
 
-    # Show entries
     entries_str = []
     for e in tr['entries']:
         stage = "Initial" if e['stage'] == 0 else f"DCA{e['stage']}"
@@ -269,7 +296,7 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     return "\n".join(lines)
 
-# === MONITOR TP + DCA + SL (Single Message + Duration) ===
+# === MONITOR TP + DCA + SL (Unchanged from your original) ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -278,7 +305,7 @@ async def monitor_tp_and_dca():
                 if not open_symbols:
                     await asyncio.sleep(TP_CHECK_INTERVAL)
                     continue
-                
+
                 prices = {}
                 try:
                     tickers = await exchange.fetch_tickers(open_symbols)
@@ -286,11 +313,10 @@ async def monitor_tp_and_dca():
                         prices[sym] = t.get('last') or t.get('close') or t.get('markPrice')
                 except Exception:
                     pass
-                
+
                 for sym in list(open_trades):
                     tr = open_trades[sym]
 
-                    # Sync position
                     try:
                         pos = await exchange.fetch_position(sym)
                         if not pos or not pos.get('info'):
@@ -346,7 +372,7 @@ async def monitor_tp_and_dca():
                         except Exception as e:
                             logging.error(f"SL close failed {sym}: {e}")
 
-                    # DCA Logic (Only edit message, no new message)
+                    # DCA Logic
                     trigger1 = initial_price * (1 - DCA1_TRIGGER_PCT) if is_long else initial_price * (1 + DCA1_TRIGGER_PCT)
                     trigger2 = initial_price * (1 - DCA2_TRIGGER_PCT) if is_long else initial_price * (1 + DCA2_TRIGGER_PCT)
 
@@ -424,37 +450,47 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-# === PROCESS SYMBOL (Create Single Message with Timeframe) ===
+# === PROCESS SYMBOL (Fixed with Pattern + Wick Filter) ===
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
         if len(candles) < 6:
             return
-        signal_time = candles[-1][0]
 
-        key_rising  = (symbol, timeframe, 'rising')
-        key_falling = (symbol, timeframe, 'falling')
+        signal_time = candles[-2][0]   # Last closed candle
+
+        key = (symbol, timeframe, 'pattern')
 
         async with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES:
                 return
-            if sent_signals.get(key_rising) == signal_time or sent_signals.get(key_falling) == signal_time:
+            if sent_signals.get(key) == signal_time:
                 return
+
+        # Pattern Detection + Wick Filter on Big Candle
+        is_rising, big_candle = detect_rising_three(candles)
+        is_falling, big_candle_f = detect_falling_three(candles)
 
         pattern = None
         side = None
-        if detect_rising_three(candles):
-            pattern, side = 'rising three', 'buy'
-            sent_signals[key_rising] = signal_time
-        elif detect_falling_three(candles):
-            pattern, side = 'falling three', 'sell'
-            sent_signals[key_falling] = signal_time
-        else:
+        signal_msg = None
+
+        if is_rising:
+            pattern = 'rising_three'
+            side, signal_msg = get_wick_signal(big_candle)
+        elif is_falling:
+            pattern = 'falling_three'
+            side, signal_msg = get_wick_signal(big_candle_f)
+
+        if not side or not signal_msg:
             return
+
+        sent_signals[key] = signal_time
 
         await prepare_symbol(symbol)
         ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
+        
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = float(round_amount(symbol, amount_raw))
         if amount <= 0:
@@ -465,7 +501,6 @@ async def process_symbol(symbol, timeframe):
 
         tp = round_price(symbol, filled_price * (1 + TP_INITIAL_PCT) if side == 'buy' else filled_price * (1 - TP_INITIAL_PCT))
 
-        # Create initial message
         initial_trade = {
             'side': side,
             'initial_price': filled_price,
@@ -476,10 +511,13 @@ async def process_symbol(symbol, timeframe):
             'dca_stage': 0,
             'msg_id_initial': None,
             'open_ts': time.time(),
-            'timeframe': timeframe   # Save timeframe for later use
+            'timeframe': timeframe,
+            'signal_reason': signal_msg,
+            'pattern': pattern
         }
 
-        msg_text = build_trade_message(initial_trade, symbol)
+        msg_text = build_trade_message(initial_trade, symbol) + f"\n\n{signal_msg}"
+        
         mid = await send_telegram(msg_text)
         initial_trade['msg_id_initial'] = mid
 
@@ -487,12 +525,12 @@ async def process_symbol(symbol, timeframe):
             open_trades[symbol] = initial_trade
             await asyncio.to_thread(save_trades)
 
-        logging.info(f"Opened {side} {symbol} @ {filled_price} on {timeframe}")
+        logging.info(f"Opened {side.upper()} {symbol} on {pattern} | {timeframe}")
 
     except Exception as e:
         logging.error(f"Trade failed {symbol} on {timeframe}: {e}")
 
-# === BATCH, SCAN, DAILY SUMMARY, MAIN (unchanged except small fixes) ===
+# === BATCH + SCAN + MAIN ===
 async def process_batch(symbols_chunk, timeframe):
     tasks = [asyncio.create_task(process_symbol(s, timeframe)) for s in symbols_chunk]
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -501,7 +539,7 @@ async def scan_loop(symbols):
     while True:
         wait_until = get_next_candle_close()
         sleep_sec = max(0, wait_until - time.time())
-        logging.info(f"Next relevant candle close in ~{sleep_sec//60} min")
+        logging.info(f"Next relevant candle close in \~{sleep_sec//60} min")
         await asyncio.sleep(sleep_sec)
 
         for tf in TIMEFRAMES:
@@ -541,17 +579,15 @@ async def main():
     symbols = get_symbols(markets)
     load_trades()
     logging.info(f"Scanning {len(symbols)} USDT perpetuals")
-    
+
     startup = (
         f"Bot restarted @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n"
+        f"Pattern + Wick Filter Active\n"
         f"Open positions: {len(open_trades)}\n"
-        f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x\n"
-        f"Initial: $15 → DCA1 $25 @ -1% → DCA2 $15 @ -2.5%\n"
-        f"TP: 1.1% → 0.6% → 0.8%\n"
-        f"SL: 6% fixed • Single updating message"
+        f"Max trades: {MAX_OPEN_TRADES} | Lev: {LEVERAGE}x"
     )
     await send_telegram(startup)
-    
+
     tasks = [
         asyncio.create_task(scan_loop(symbols)),
         asyncio.create_task(monitor_tp_and_dca()),

@@ -18,7 +18,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAMES = ['5m', '30m']                  
 CANDLE_LIMIT = 6
-MIN_BIG_BODY_PCT = 1.0          # Kept as requested
+MIN_BIG_BODY_PCT = 1.0          
 MAX_SMALL_BODY_PCT = 0.1
 MIN_LOWER_WICK_PCT = 20.0
 BATCH_DELAY = 2.0
@@ -226,24 +226,46 @@ def round_amount(symbol, amt):
     except:
         return amt
 
-# === PATTERN DETECTION ===
+# === PATTERN DETECTION - Big candle volume > previous 4 candles ===
 def detect_rising_three(candles):
-    if len(candles) < 6: return False, None
+    if len(candles) < 6: 
+        return False, None
+    
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
-    avg_vol = sum(c[5] for c in candles[-6:-1]) / 5
-    big_green = is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_vol
+    
+    # Big candle volume must be strictly greater than previous 4 candles
+    big_vol = c2[5]
+    prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8] if abs(i) <= len(candles)]
+    vol_condition = len(prev_volumes) >= 4 and all(big_vol > v for v in prev_volumes)
+
+    big_green = (is_bullish(c2) and 
+                 body_pct(c2) >= MIN_BIG_BODY_PCT and 
+                 vol_condition)
+    
     small_red_1 = is_bearish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
     small_red_0 = is_bearish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
     return big_green and small_red_1 and small_red_0, c2
 
+
 def detect_falling_three(candles):
-    if len(candles) < 6: return False, None
+    if len(candles) < 6: 
+        return False, None
+    
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
-    avg_vol = sum(c[5] for c in candles[-6:-1]) / 5
-    big_red = is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and c2[5] > avg_vol
+    
+    # Big candle volume must be strictly greater than previous 4 candles
+    big_vol = c2[5]
+    prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8] if abs(i) <= len(candles)]
+    vol_condition = len(prev_volumes) >= 4 and all(big_vol > v for v in prev_volumes)
+
+    big_red = (is_bearish(c2) and 
+               body_pct(c2) >= MIN_BIG_BODY_PCT and 
+               vol_condition)
+    
     small_green_1 = is_bullish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
     small_green_0 = is_bullish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
     return big_red and small_green_1 and small_green_0, c2
+
 
 def get_symbols(markets):
     return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
@@ -288,6 +310,10 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
 
+    # Wick % shown in all messages including TP/SL hit
+    if tr.get('signal_reason'):
+        lines.append(f"Signal: {tr['signal_reason']}")
+
     if is_final and hit_type:
         lines.append(f"**{hit_type} HIT** | Exit: {exit_price:.6f}")
         lines.append(f"PnL: {pnl_pct:.2f}% (${pnl_usdt:+.2f})")
@@ -296,7 +322,7 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     return "\n".join(lines)
 
-# === MONITOR TP + DCA + SL (Unchanged from your original) ===
+# === MONITOR TP + DCA + SL ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -450,14 +476,14 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-# === PROCESS SYMBOL (Fixed with Pattern + Wick Filter) ===
+# === PROCESS SYMBOL ===
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
         if len(candles) < 6:
             return
 
-        signal_time = candles[-2][0]   # Last closed candle
+        signal_time = candles[-2][0]   
 
         key = (symbol, timeframe, 'pattern')
 
@@ -467,7 +493,6 @@ async def process_symbol(symbol, timeframe):
             if sent_signals.get(key) == signal_time:
                 return
 
-        # Pattern Detection + Wick Filter on Big Candle
         is_rising, big_candle = detect_rising_three(candles)
         is_falling, big_candle_f = detect_falling_three(candles)
 
@@ -490,7 +515,7 @@ async def process_symbol(symbol, timeframe):
         await prepare_symbol(symbol)
         ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
-        
+
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = float(round_amount(symbol, amount_raw))
         if amount <= 0:
@@ -517,7 +542,7 @@ async def process_symbol(symbol, timeframe):
         }
 
         msg_text = build_trade_message(initial_trade, symbol) + f"\n\n{signal_msg}"
-        
+
         mid = await send_telegram(msg_text)
         initial_trade['msg_id_initial'] = mid
 

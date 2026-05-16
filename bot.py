@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TIMEFRAMES = ['5m', '30m']                  
+TIMEFRAMES = ['5m', '15m']                  # Changed 30m → 15m
 CANDLE_LIMIT = 6
 MIN_BIG_BODY_PCT = 1.0          
 MAX_SMALL_BODY_PCT = 0.1
@@ -188,6 +188,7 @@ def upper_wick_pct(c):
     upper = h - max(o, cc)
     return (upper / body) * 100
 
+# === WICK SIGNAL - Green candle sells if Upper > 50% ===
 def get_wick_signal(candle):
     if body_pct(candle) < 0.5:
         return None, None
@@ -197,7 +198,7 @@ def get_wick_signal(candle):
     is_green = is_bullish(candle)
 
     if is_green:
-        if upper > 40 or (upper > 30 and lower > 30):
+        if upper > 50 or (upper > 30 and lower > 30):
             reason = f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL** (Rejection)"
             return 'sell', reason
         else:
@@ -233,7 +234,6 @@ def detect_rising_three(candles):
     
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
     
-    # Big candle volume must be strictly greater than previous 4 candles
     big_vol = c2[5]
     prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8] if abs(i) <= len(candles)]
     vol_condition = len(prev_volumes) >= 4 and all(big_vol > v for v in prev_volumes)
@@ -253,7 +253,6 @@ def detect_falling_three(candles):
     
     c2, c1, c0 = candles[-4], candles[-3], candles[-2]
     
-    # Big candle volume must be strictly greater than previous 4 candles
     big_vol = c2[5]
     prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8] if abs(i) <= len(candles)]
     vol_condition = len(prev_volumes) >= 4 and all(big_vol > v for v in prev_volumes)
@@ -310,7 +309,6 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
 
-    # Wick % shown in all messages including TP/SL hit
     if tr.get('signal_reason'):
         lines.append(f"Signal: {tr['signal_reason']}")
 

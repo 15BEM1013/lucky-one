@@ -13,7 +13,7 @@ import math
 # Load .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
-=== CONFIG ===
+# ====================== CONFIG ======================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAMES = ['5m', '30m']
@@ -54,7 +54,7 @@ trade_lock = asyncio.Lock()
 def get_ist_time():
     return datetime.now(pytz.timezone('Asia/Kolkata'))
 
-=== TRADE PERSISTENCE ===
+# ====================== TRADE PERSISTENCE ======================
 def save_trades():
     try:
         with open(TRADE_FILE, 'w') as f:
@@ -86,7 +86,7 @@ def save_closed_trade(closed):
     except Exception as e:
         logging.error(f"Save closed trade error: {e}")
 
-=== TELEGRAM ===
+# ====================== TELEGRAM ======================
 async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -118,7 +118,7 @@ async def edit_telegram_message(mid, new_text):
     except Exception as e:
         logging.error(f"Telegram edit error: {e}")
 
-=== EXCHANGE ===
+# ====================== EXCHANGE ======================
 async def initialize_exchange():
     ex = ccxt.binance({
         'apiKey': API_KEY,
@@ -134,7 +134,7 @@ exchange = None
 sent_signals = {}
 open_trades = {}
 
-=== HELPERS ===
+# ====================== HELPERS ======================
 def format_duration(seconds):
     if seconds < 60:
         return f"{int(seconds)}s"
@@ -146,10 +146,11 @@ def format_duration(seconds):
     minutes = minutes % 60
     return f"{hours}h {minutes}m"
 
-=== CANDLE & PATTERN ===
+# ====================== CANDLE & PATTERN ======================
 def is_bullish(c): return c[4] > c[1]
 def is_bearish(c): return c[4] < c[1]
 def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
+
 def lower_wick_pct(c):
     o, h, l, cc = c[1], c[2], c[3], c[4]
     body = abs(cc - o)
@@ -213,7 +214,7 @@ def get_avg_entry_and_total(trade):
     weighted = sum(e['price'] * e['amount'] for e in trade['entries'])
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
-=== BUILD TRADE MESSAGE ===
+# ====================== BUILD TRADE MESSAGE ======================
 def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
     is_long = tr['side'] == 'buy'
     duration = format_duration(time.time() - tr['open_ts'])
@@ -225,10 +226,7 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
         f"Duration: {duration}"
     ]
 
-    entries_str = []
-    for e in tr['entries']:
-        stage = "Initial" if e['stage'] == 0 else f"DCA{e['stage']}"
-        entries_str.append(f"{stage}: {e['price']:.6f} (${e['margin']})")
+    entries_str = [f"{'Initial' if e['stage'] == 0 else f'DCA{e['stage']}'}": {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
     lines.append("Entries: " + " | ".join(entries_str))
 
     lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
@@ -241,7 +239,7 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     return "\n".join(lines)
 
-# ====================== NEW HELPER FUNCTIONS (Added) ======================
+# ====================== DCA & CLOSE HELPERS ======================
 async def execute_dca(sym, tr, stage, capital):
     try:
         is_long = tr['side'] == 'buy'
@@ -312,7 +310,7 @@ async def close_position(sym, tr, hit_type, current):
         logging.error(f"Failed to close {hit_type} on {sym}: {e}")
         await send_telegram(f"⚠️ Failed to close {hit_type} on {sym}\nError: {str(e)}")
 
-=== MONITOR TP + DCA + SL (UPDATED) ===
+# ====================== MONITOR TP + DCA + SL ======================
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -337,10 +335,8 @@ async def monitor_tp_and_dca():
                     # Sync real position
                     try:
                         pos = await exchange.fetch_position(sym)
-                        if not pos or not pos.get('info'):
-                            continue
-                        info = pos['info']
-                        real_amount = abs(float(info.get('positionAmt', '0')))
+                        info = pos.get('info') or pos
+                        real_amount = abs(float(info.get('positionAmt', 0)))
                         if real_amount <= 0.0001:
                             await send_telegram(f"🗑️ Position on {sym} closed externally")
                             del open_trades[sym]
@@ -360,7 +356,7 @@ async def monitor_tp_and_dca():
                             continue
                     current = float(current)
 
-                    # SL Check (using avg_entry)
+                    # SL Check
                     sl_level = tr['avg_entry'] * (1 - SL_PCT) if is_long else tr['avg_entry'] * (1 + SL_PCT)
                     if (is_long and current <= sl_level) or (not is_long and current >= sl_level):
                         await close_position(sym, tr, "STOP-LOSS", current)
@@ -394,7 +390,7 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-=== PROCESS SYMBOL ===
+# ====================== PROCESS SYMBOL ======================
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
@@ -402,7 +398,7 @@ async def process_symbol(symbol, timeframe):
             return
         signal_time = candles[-1][0]
 
-        key_rising  = (symbol, timeframe, 'rising')
+        key_rising = (symbol, timeframe, 'rising')
         key_falling = (symbol, timeframe, 'falling')
 
         async with trade_lock:
@@ -411,14 +407,13 @@ async def process_symbol(symbol, timeframe):
             if sent_signals.get(key_rising) == signal_time or sent_signals.get(key_falling) == signal_time:
                 return
 
-        pattern = None
         side = None
         if detect_rising_three(candles):
-            pattern, side = 'rising three', 'buy'
-            sent_signals[key_rising] = signal_time
+            side = 'buy'
+            sent_signals[(symbol, timeframe, 'rising')] = signal_time
         elif detect_falling_three(candles):
-            pattern, side = 'falling three', 'sell'
-            sent_signals[key_falling] = signal_time
+            side = 'sell'
+            sent_signals[(symbol, timeframe, 'falling')] = signal_time
         else:
             return
 
@@ -461,7 +456,7 @@ async def process_symbol(symbol, timeframe):
     except Exception as e:
         logging.error(f"Trade failed {symbol} on {timeframe}: {e}")
 
-=== BATCH, SCAN, DAILY SUMMARY, MAIN ===
+# ====================== BATCH & SCAN ======================
 async def process_batch(symbols_chunk, timeframe):
     tasks = [asyncio.create_task(process_symbol(s, timeframe)) for s in symbols_chunk]
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -503,6 +498,7 @@ async def daily_summary():
         except Exception as e:
             logging.error(f"Daily summary error: {e}")
 
+# ====================== MAIN ======================
 async def main():
     global exchange
     exchange = await initialize_exchange()

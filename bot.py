@@ -254,7 +254,12 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
         f"Duration: {duration}"
     ]
 
-    entries_str = [f"{'Initial' if e['stage']==0 else f'DCA{e['stage']}'}: {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
+    # FIXED LINE
+    entries_str = [
+        f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']})"
+        for e in tr['entries']
+    ]
+
     lines.append("Entries: " + " | ".join(entries_str))
     lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
 

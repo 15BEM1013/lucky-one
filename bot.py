@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 # ====================== CONFIG ======================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TIMEFRAMES = ['5m', '30m']
+TIMEFRAMES = ['5m', '15m']
 CANDLE_LIMIT = 6
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
@@ -43,8 +43,6 @@ API_SECRET = os.getenv('BINANCE_SECRET')
 
 if not API_KEY or not API_SECRET:
     raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
-
-PROXY_LIST = []
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -226,9 +224,13 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
         f"Duration: {duration}"
     ]
 
-    entries_str = [f"{'Initial' if e['stage'] == 0 else f'DCA{e['stage']}'}": {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
+    # Fixed this line
+    entries_str = []
+    for e in tr['entries']:
+        stage = "Initial" if e['stage'] == 0 else f"DCA{e['stage']}"
+        entries_str.append(f"{stage}: {e['price']:.6f} (${e['margin']})")
+    
     lines.append("Entries: " + " | ".join(entries_str))
-
     lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
 
     if is_final and hit_type:
@@ -410,10 +412,10 @@ async def process_symbol(symbol, timeframe):
         side = None
         if detect_rising_three(candles):
             side = 'buy'
-            sent_signals[(symbol, timeframe, 'rising')] = signal_time
+            sent_signals[key_rising] = signal_time
         elif detect_falling_three(candles):
             side = 'sell'
-            sent_signals[(symbol, timeframe, 'falling')] = signal_time
+            sent_signals[key_falling] = signal_time
         else:
             return
 

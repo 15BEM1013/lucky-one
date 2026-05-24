@@ -24,20 +24,23 @@ MIN_LOWER_WICK_PCT = 20.0
 BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 
-CAPITAL_INITIAL = 15.0
-CAPITAL_DCA1 = 25.0
-CAPITAL_DCA2 = 15.0
+# TRADE SETTINGS
+CAPITAL_INITIAL = 10.0
+LEVERAGE = 9
 
-MAX_MARGIN_PER_TRADE = 55.0
-LEVERAGE = 7
+CAPITAL_DCA1_NORMAL = 20.0
+CAPITAL_DCA1_REVERSAL = 10.0
+CAPITAL_DCA2 = 5.0
 
-TP_INITIAL_PCT = 1.1 / 100
+SL_PCT = 8.0 / 100
+
+TP_INITIAL_NORMAL_PCT = 1.0 / 100
+TP_INITIAL_REVERSAL_PCT = 0.5 / 100
+
 TP_AFTER_DCA1_PCT = 0.6 / 100
-TP_AFTER_DCA2_PCT = 0.8 / 100
+TP_AFTER_DCA2_PCT = 0.4 / 100
 
-DCA1_TRIGGER_PCT = 1.0 / 100
-DCA2_TRIGGER_PCT = 2.5 / 100
-SL_PCT = 6.0 / 100
+DCA2_TRIGGER_PCT = 1.5 / 100
 
 TP_CHECK_INTERVAL = 0.5
 MAX_OPEN_TRADES = 5
@@ -50,8 +53,6 @@ API_SECRET = os.getenv('BINANCE_SECRET')
 
 if not API_KEY or not API_SECRET:
     raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
-
-PROXY_LIST = []
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -98,11 +99,7 @@ async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data={
-                'chat_id': CHAT_ID,
-                'text': msg,
-                'parse_mode': 'Markdown'
-            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 r = await resp.json()
                 return r.get('result', {}).get('message_id')
     except Exception as e:
@@ -110,17 +107,11 @@ async def send_telegram(msg):
         return None
 
 async def edit_telegram_message(mid, new_text):
-    if not mid:
-        return
+    if not mid: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     try:
         async with aiohttp.ClientSession() as session:
-            await session.post(url, data={
-                'chat_id': CHAT_ID,
-                'message_id': mid,
-                'text': new_text,
-                'parse_mode': 'Markdown'
-            }, timeout=aiohttp.ClientTimeout(total=10))
+            await session.post(url, data={'chat_id': CHAT_ID, 'message_id': mid, 'text': new_text, 'parse_mode': 'Markdown'}, timeout=aiohttp.ClientTimeout(total=10))
     except Exception as e:
         logging.error(f"Telegram edit error: {e}")
 
@@ -142,12 +133,10 @@ open_trades = {}
 
 # === HELPERS ===
 def format_duration(seconds):
-    if seconds < 60:
-        return f"{int(seconds)}s"
+    if seconds < 60: return f"{int(seconds)}s"
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
-    if minutes < 60:
-        return f"{minutes}m {secs}s"
+    if minutes < 60: return f"{minutes}m {secs}s"
     hours = minutes // 60
     minutes = minutes % 60
     return f"{hours}h {minutes}m"
@@ -172,21 +161,24 @@ def upper_wick_pct(c):
 
 def get_wick_signal(candle):
     if body_pct(candle) < 0.5:
-        return None, None
+        return None, None, False
     upper = upper_wick_pct(candle)
     lower = lower_wick_pct(candle)
     is_green = is_bullish(candle)
+    is_strong_rejection = False
 
     if is_green:
         if upper > 50 or (upper > 30 and lower > 30):
-            return 'sell', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**"
+            is_strong_rejection = True
+            return 'sell', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
         else:
-            return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**"
+            return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
     else:
         if lower > 30 or (upper > 30 and lower > 30):
-            return 'buy', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**"
+            is_strong_rejection = True
+            return 'buy', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
         else:
-            return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**"
+            return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
 
 def round_price(symbol, price):
     try:
@@ -238,43 +230,54 @@ async def prepare_symbol(symbol):
     except Exception as e:
         logging.warning(f"Prepare {symbol} failed: {e}")
 
-def get_avg_entry_and_total(trade):
-    total_pos = sum(e['amount'] for e in trade['entries'])
-    weighted = sum(e['price'] * e['amount'] for e in trade['entries'])
+def get_avg_entry_and_total(tr):
+    total_pos = sum(e['amount'] for e in tr['entries'])
+    weighted = sum(e['price'] * e['amount'] for e in tr['entries'])
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
 # === BUILD TRADE MESSAGE ===
 def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
     is_long = tr['side'] == 'buy'
     duration = format_duration(time.time() - tr['open_ts'])
+    avg = tr['avg_entry']
 
     lines = [
         f"**{'LONG' if is_long else 'SHORT'}** {sym} ({tr.get('timeframe', 'N/A')})",
-        f"Entry: {tr['initial_price']:.6f} | Avg: {tr['avg_entry']:.6f}",
+        f"Entry: {tr['initial_price']:.6f} | Avg: {avg:.6f}",
         f"Duration: {duration}"
     ]
 
-    # FIXED LINE
-    entries_str = [
-        f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']})"
-        for e in tr['entries']
-    ]
-
+    entries_str = [f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
     lines.append("Entries: " + " | ".join(entries_str))
-    lines.append(f"TP: {tr['tp']:.6f} | SL: {SL_PCT*100:.1f}%")
+
+    sl_price = round_price(sym, avg * (1 - SL_PCT) if is_long else avg * (1 + SL_PCT))
+    lines.append(f"TP: {tr['tp']:.6f} | SL: {sl_price:.6f} (8%)")
+
+    if tr.get('is_reversal'):
+        dca1 = tr.get('dca1_level')
+        dca2 = tr.get('dca2_level')
+        dir_symbol = "+" if not is_long else "-"
+        lines.append(f"DCA1 Level: {dca1:.6f} ({dir_symbol}1.0%)")
+        lines.append(f"DCA2 Level: {dca2:.6f} ({dir_symbol}1.5% from DCA1)")
+    else:
+        dca1 = tr.get('dca1_level')
+        dca2 = tr.get('dca2_level')
+        lines.append(f"DCA1 Level: {dca1:.6f} (Big Candle Open)")
+        lines.append(f"DCA2 Level: {dca2:.6f} (1.5% from DCA1)")
 
     if tr.get('signal_reason'):
         lines.append(f"Signal: {tr['signal_reason']}")
 
+    pattern_type = "Strong Rejection" if tr.get('is_reversal') else "Continuation"
+    lines.append(f"{tr.get('pattern', 'Pattern')} - {pattern_type}")
+
     if is_final and hit_type:
         lines.append(f"**{hit_type} HIT** | Exit: {exit_price:.6f}")
         lines.append(f"PnL: {pnl_pct:.2f}% (${pnl_usdt:+.2f})")
-    else:
-        lines.append(f"DCA Stage: {tr['dca_stage']}/2")
 
     return "\n".join(lines)
 
-# === MONITOR TP + DCA + SL ===
+# === FIXED MONITOR ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -284,46 +287,29 @@ async def monitor_tp_and_dca():
                     continue
 
                 symbols = list(open_trades.keys())
-                if not symbols:
-                    await asyncio.sleep(TP_CHECK_INTERVAL)
-                    continue
-
-                try:
-                    tickers = await exchange.fetch_tickers(symbols)
-                    prices = {sym: t.get('last') or t.get('close') or t.get('markPrice') for sym, t in tickers.items()}
-                except Exception as e:
-                    logging.error(f"Failed to fetch tickers: {e}")
-                    await asyncio.sleep(TP_CHECK_INTERVAL)
-                    continue
+                tickers = await exchange.fetch_tickers(symbols)
+                prices = {sym: t.get('last') or t.get('close') or t.get('markPrice') for sym, t in tickers.items()}
 
                 for sym in list(open_trades.keys()):
                     tr = open_trades[sym]
                     current = prices.get(sym)
-                    if not current:
-                        continue
+                    if not current: continue
 
                     is_long = tr['side'] == 'buy'
                     avg_entry = tr['avg_entry']
                     current_tp = tr['tp']
 
-                    # === SL CHECK ===
                     sl_price = avg_entry * (1 - SL_PCT) if is_long else avg_entry * (1 + SL_PCT)
                     if (is_long and current <= sl_price) or (not is_long and current >= sl_price):
                         await close_trade(sym, "SL", current)
                         continue
 
-                    # === TP CHECK ===
                     if (is_long and current >= current_tp) or (not is_long and current <= current_tp):
                         await close_trade(sym, "TP", current)
                         continue
 
-                    # === DCA LOGIC ===
                     if tr['dca_stage'] < 2:
-                        dca_trigger = DCA1_TRIGGER_PCT if tr['dca_stage'] == 0 else DCA2_TRIGGER_PCT
-                        dca_level = avg_entry * (1 - dca_trigger) if is_long else avg_entry * (1 + dca_trigger)
-
-                        if (is_long and current <= dca_level) or (not is_long and current >= dca_level):
-                            await execute_dca(sym, tr, current)
+                        await check_and_execute_dca(sym, tr, current)
 
             await asyncio.sleep(TP_CHECK_INTERVAL)
 
@@ -331,17 +317,28 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-async def execute_dca(sym, tr, current_price):
+# === FIXED DCA WITH INSUFFICIENT HANDLING ===
+async def check_and_execute_dca(sym, tr, current_price):
     try:
         dca_stage = tr['dca_stage'] + 1
-        capital = CAPITAL_DCA1 if dca_stage == 1 else CAPITAL_DCA2
+        is_reversal = tr.get('is_reversal', False)
+        is_long = tr['side'] == 'buy'
+
+        if dca_stage == 1:
+            dca_trigger_price = tr['dca1_level']
+            capital = CAPITAL_DCA1_REVERSAL if is_reversal else CAPITAL_DCA1_NORMAL
+        else:
+            dca_trigger_price = tr['dca2_level']
+            capital = CAPITAL_DCA2
+
+        should_dca = (is_long and current_price <= dca_trigger_price) or (not is_long and current_price >= dca_trigger_price)
+        if not should_dca:
+            return
 
         side = tr['side']
         amount_raw = (capital * LEVERAGE) / current_price
         amount = round_amount(sym, amount_raw)
-
-        if amount <= 0:
-            return
+        if amount <= 0: return
 
         order = await exchange.create_market_order(sym, side, amount)
         filled_price = round_price(sym, order.get('average') or current_price)
@@ -354,26 +351,26 @@ async def execute_dca(sym, tr, current_price):
             'stage': dca_stage
         })
 
-        avg_entry, total_amount = get_avg_entry_and_total(tr)
+        avg_entry, _ = get_avg_entry_and_total(tr)
         tr['avg_entry'] = avg_entry
-        tr['total_amount'] = total_amount
         tr['dca_stage'] = dca_stage
 
-        # Update TP based on new stage
-        if dca_stage == 1:
-            tp_pct = TP_AFTER_DCA1_PCT
-        else:
-            tp_pct = TP_AFTER_DCA2_PCT
-
-        tr['tp'] = round_price(sym, avg_entry * (1 + tp_pct) if side == 'buy' else avg_entry * (1 - tp_pct))
+        tp_pct = TP_AFTER_DCA1_PCT if dca_stage == 1 else TP_AFTER_DCA2_PCT
+        tr['tp'] = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
 
         logging.info(f"DCA{dca_stage} executed on {sym} @ {filled_price}")
 
-        # Update Telegram
         msg_text = build_trade_message(tr, sym)
         if tr.get('msg_id_initial'):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
+    except ccxt.InsufficientFunds:
+        warning = f"\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not execute DCA{dca_stage} | Required: ${capital}"
+        msg_text = build_trade_message(tr, sym) + warning
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+        logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
+        
     except Exception as e:
         logging.error(f"DCA failed on {sym}: {e}")
 
@@ -382,78 +379,59 @@ async def close_trade(sym, hit_type, exit_price):
         tr = open_trades[sym]
         side = tr['side']
         close_side = 'sell' if side == 'buy' else 'buy'
-
         total_amount = sum(e['amount'] for e in tr['entries'])
 
         close_order = await exchange.create_market_order(sym, close_side, total_amount)
         filled_exit = round_price(sym, close_order.get('average') or exit_price)
 
-        # Calculate PnL
         avg_entry = tr['avg_entry']
-        if side == 'buy':
-            pnl_pct = (filled_exit - avg_entry) / avg_entry * 100
-        else:
-            pnl_pct = (avg_entry - filled_exit) / avg_entry * 100
-
+        pnl_pct = (filled_exit - avg_entry) / avg_entry * 100 if side == 'buy' else (avg_entry - filled_exit) / avg_entry * 100
         total_margin = sum(e['margin'] for e in tr['entries'])
         pnl_usdt = total_margin * (pnl_pct / 100) * LEVERAGE
 
-        closed = {
-            **tr,
-            'exit_price': filled_exit,
-            'exit_ts': time.time(),
-            'hit_type': hit_type,
-            'pnl_pct': pnl_pct,
-            'pnl_usdt': pnl_usdt,
-            'closed_at': get_ist_time().isoformat()
-        }
+        closed = {**tr, 'exit_price': filled_exit, 'exit_ts': time.time(), 'hit_type': hit_type,
+                  'pnl_pct': pnl_pct, 'pnl_usdt': pnl_usdt, 'closed_at': get_ist_time().isoformat()}
 
         save_closed_trade(closed)
 
-        msg_text = build_trade_message(tr, sym, is_final=True, hit_type=hit_type,
-                                       exit_price=filled_exit, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+        msg_text = build_trade_message(tr, sym, is_final=True, hit_type=hit_type, exit_price=filled_exit, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
         if tr.get('msg_id_initial'):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
-        else:
-            await send_telegram(msg_text)
 
         del open_trades[sym]
         save_trades()
-        logging.info(f"Closed {sym} on {hit_type} | PnL: {pnl_pct:.2f}% (${pnl_usdt:.2f})")
 
     except Exception as e:
         logging.error(f"Close trade failed {sym}: {e}")
 
-# === REST OF THE CODE (unchanged except minor improvements) ===
+# === PROCESS SYMBOL WITH INSUFFICIENT HANDLING ===
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
-        if len(candles) < 9:
-            return
+        if len(candles) < 9: return
 
         signal_time = candles[-2][0]
         key = (symbol, timeframe, 'pattern')
 
         async with trade_lock:
-            if len(open_trades) >= MAX_OPEN_TRADES:
-                return
-            if sent_signals.get(key) == signal_time:
-                return
+            if len(open_trades) >= MAX_OPEN_TRADES: return
+            if sent_signals.get(key) == signal_time: return
 
         is_rising, big_candle = detect_rising_three(candles)
         is_falling, big_candle_f = detect_falling_three(candles)
 
         if is_rising:
-            pattern = 'rising_three'
-            side, signal_msg = get_wick_signal(big_candle)
+            pattern = 'Rising Three'
+            side, signal_msg, is_reversal = get_wick_signal(big_candle)
+            big_open = big_candle[1]
         elif is_falling:
-            pattern = 'falling_three'
-            side, signal_msg = get_wick_signal(big_candle_f)
+            pattern = 'Falling Three'
+            side, signal_msg, is_reversal = get_wick_signal(big_candle_f)
+            big_open = big_candle_f[1]
         else:
             return
 
-        if not side or not signal_msg:
-            return
+        if not side: return
 
         sent_signals[key] = signal_time
         await prepare_symbol(symbol)
@@ -463,19 +441,25 @@ async def process_symbol(symbol, timeframe):
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = round_amount(symbol, amount_raw)
-        if amount <= 0:
-            return
+        if amount <= 0: return
 
         entry_order = await exchange.create_market_order(symbol, side, amount)
         filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
-        tp = round_price(symbol, filled_price * (1 + TP_INITIAL_PCT) if side == 'buy' else filled_price * (1 - TP_INITIAL_PCT))
+        tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
+        tp = round_price(symbol, filled_price * (1 + tp_pct) if side == 'buy' else filled_price * (1 - tp_pct))
+
+        if is_reversal:
+            dca1_level = filled_price * (1 + 0.01) if side == 'sell' else filled_price * (1 - 0.01)
+            dca2_level = dca1_level * (1 + DCA2_TRIGGER_PCT) if side == 'sell' else dca1_level * (1 - DCA2_TRIGGER_PCT)
+        else:
+            dca1_level = big_open
+            dca2_level = big_open * (1 - DCA2_TRIGGER_PCT) if side == 'buy' else big_open * (1 + DCA2_TRIGGER_PCT)
 
         initial_trade = {
             'side': side,
             'initial_price': filled_price,
             'entries': [{'price': filled_price, 'amount': amount, 'margin': CAPITAL_INITIAL, 'ts': time.time(), 'stage': 0}],
-            'total_amount': amount,
             'avg_entry': filled_price,
             'tp': tp,
             'dca_stage': 0,
@@ -483,10 +467,13 @@ async def process_symbol(symbol, timeframe):
             'open_ts': time.time(),
             'timeframe': timeframe,
             'signal_reason': signal_msg,
-            'pattern': pattern
+            'pattern': pattern,
+            'is_reversal': is_reversal,
+            'dca1_level': round_price(symbol, dca1_level),
+            'dca2_level': round_price(symbol, dca2_level)
         }
 
-        msg_text = build_trade_message(initial_trade, symbol) + f"\n\n{signal_msg}"
+        msg_text = build_trade_message(initial_trade, symbol)
         mid = await send_telegram(msg_text)
         initial_trade['msg_id_initial'] = mid
 
@@ -494,21 +481,26 @@ async def process_symbol(symbol, timeframe):
             open_trades[symbol] = initial_trade
             await asyncio.to_thread(save_trades)
 
-        logging.info(f"Opened {side.upper()} {symbol} on {pattern} | {timeframe}")
+        logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'}")
 
     except ccxt.InsufficientFunds:
-        await send_telegram(f"⚠️ **Insufficient Balance** for {symbol}")
+        # Still show the trade setup with warning
+        warning = "\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not open position. Required: \~$10"
+        msg_text = build_trade_message(initial_trade, symbol) + warning if 'initial_trade' in locals() else f"**Signal on {symbol}**\n⚠️ **INSUFFICIENT FUNDS**"
+        await send_telegram(msg_text)
+        logging.warning(f"Insufficient funds for initial trade on {symbol}")
+
     except Exception as e:
         logging.error(f"Trade failed {symbol}: {e}")
 
-# Batch & Scan functions remain the same...
+# === SCANNING ===
 async def process_batch(symbols_chunk, timeframe):
     tasks = [asyncio.create_task(process_symbol(s, timeframe)) for s in symbols_chunk]
     await asyncio.gather(*tasks, return_exceptions=True)
 
 async def scan_loop(symbols):
     while True:
-        wait_until = get_next_candle_close()  # Reuse your helper
+        wait_until = get_next_candle_close()
         sleep_sec = max(0, wait_until - time.time())
         logging.info(f"Next scan in \~{sleep_sec//60} min")
         await asyncio.sleep(sleep_sec)
@@ -557,8 +549,7 @@ async def main():
 
     logging.info(f"Starting bot with {len(symbols)} symbols")
 
-    startup_msg = f"🚀 **Bot Restarted** @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\n" \
-                  f"Patterns + Wick Filter Active\nOpen Trades: {len(open_trades)} | Max: {MAX_OPEN_TRADES}"
+    startup_msg = f"🚀 **Bot Restarted** @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\nPatterns + Wick Filter | SL: 8% | Insufficient Warning Active"
     await send_telegram(startup_msg)
 
     tasks = [

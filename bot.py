@@ -159,9 +159,11 @@ def upper_wick_pct(c):
     upper = h - max(o, cc)
     return (upper / body) * 100
 
+# ==================== ONLY THIS FUNCTION WAS CHANGED ====================
 def get_wick_signal(candle):
     if body_pct(candle) < 0.5:
         return None, None, False
+    
     upper = upper_wick_pct(candle)
     lower = lower_wick_pct(candle)
     is_green = is_bullish(candle)
@@ -174,11 +176,16 @@ def get_wick_signal(candle):
         else:
             return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
     else:
-        if lower > 30 or (upper > 30 and lower > 30):
+        # Red Candle Logic as per your latest requirement
+        if upper > 30 and lower > 30:
+            # ONLY this case allowed for BUY (Double Wick Rejection)
             is_strong_rejection = True
             return 'buy', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
         else:
+            # All other red candle cases → SELL (Continuation)
+            # Single lower wick >30% is now disabled
             return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
+# =====================================================================
 
 def round_price(symbol, price):
     try:
@@ -370,7 +377,7 @@ async def check_and_execute_dca(sym, tr, current_price):
         if tr.get('msg_id_initial'):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
         logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
-        
+
     except Exception as e:
         logging.error(f"DCA failed on {sym}: {e}")
 
@@ -485,7 +492,7 @@ async def process_symbol(symbol, timeframe):
 
     except ccxt.InsufficientFunds:
         # Still show the trade setup with warning
-        warning = "\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not open position. Required: \~$10"
+        warning = "\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not open position. Required: \\~$10"
         msg_text = build_trade_message(initial_trade, symbol) + warning if 'initial_trade' in locals() else f"**Signal on {symbol}**\n⚠️ **INSUFFICIENT FUNDS**"
         await send_telegram(msg_text)
         logging.warning(f"Insufficient funds for initial trade on {symbol}")
@@ -502,7 +509,7 @@ async def scan_loop(symbols):
     while True:
         wait_until = get_next_candle_close()
         sleep_sec = max(0, wait_until - time.time())
-        logging.info(f"Next scan in \~{sleep_sec//60} min")
+        logging.info(f"Next scan in \\~{sleep_sec//60} min")
         await asyncio.sleep(sleep_sec)
 
         for tf in TIMEFRAMES:

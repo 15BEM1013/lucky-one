@@ -159,48 +159,52 @@ def upper_wick_pct(c):
     upper = h - max(o, cc)
     return (upper / body) * 100
 
-# ==================== ONLY THIS FUNCTION WAS CHANGED ====================
 def get_wick_signal(candle):
+    # Ignore tiny body candles
     if body_pct(candle) < 0.5:
         return None, None, False
-    
+
     upper = upper_wick_pct(candle)
     lower = lower_wick_pct(candle)
+
     is_green = is_bullish(candle)
-    is_strong_rejection = False
 
+    # =========================
+    # GREEN CANDLE LOGIC
+    # =========================
     if is_green:
+
+        # Strong rejection -> SELL reversal
         if upper > 50 or (upper > 30 and lower > 30):
-            is_strong_rejection = True
-            return 'sell', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
-        else:
-            return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
+            return (
+                'sell',
+                f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**",
+                True
+            )
+
+        # Normal bullish continuation
+        return (
+            'buy',
+            f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**",
+            False
+        )
+
+    # =========================
+    # RED CANDLE LOGIC
+    # =========================
     else:
-        # Red Candle Logic as per your latest requirement
-        if upper > 30 and lower > 30:
-            # ONLY this case allowed for BUY (Double Wick Rejection)
-            is_strong_rejection = True
-            return 'buy', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
-        else:
-            # All other red candle cases → SELL (Continuation)
-            # Single lower wick >30% is now disabled
-            return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
-# =====================================================================
 
-def round_price(symbol, price):
-    try:
-        m = exchange.market(symbol)
-        tick = float(m['info']['filters'][0]['tickSize'])
-        prec = int(round(-math.log10(tick)))
-        return round(price, prec)
-    except:
-        return price
+        # Block strong rejection red candles completely
+        if lower > 30 or (upper > 30 and lower > 30):
+            return None, None, False
 
-def round_amount(symbol, amt):
-    try:
-        return float(exchange.amount_to_precision(symbol, amt))
-    except:
-        return amt
+        # Normal bearish continuation
+        return (
+            'sell',
+            f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**",
+            False
+        )
+
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):

@@ -159,42 +159,41 @@ def upper_wick_pct(c):
     upper = h - max(o, cc)
     return (upper / body) * 100
 
-# === PRECISION HELPERS (Fixed) ===
+def get_wick_signal(candle):
+    if body_pct(candle) < 0.5:
+        return None, None, False
+    upper = upper_wick_pct(candle)
+    lower = lower_wick_pct(candle)
+    is_green = is_bullish(candle)
+    is_strong_rejection = False
+
+    if is_green:
+        if upper > 50 or (upper > 30 and lower > 30):
+            is_strong_rejection = True
+            return 'sell', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
+        else:
+            return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
+    else:
+        if lower > 30 or (upper > 30 and lower > 30):
+            is_strong_rejection = True
+            return 'buy', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", is_strong_rejection
+        else:
+            return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", is_strong_rejection
+
 def round_price(symbol, price):
     try:
-        return float(exchange.price_to_precision(symbol, price))
-    except Exception as e:
-        logging.warning(f"Price rounding failed for {symbol}: {e}")
-        try:
-            market = exchange.market(symbol)
-            precision = market['precision']['price']
-            return round(float(price), precision if isinstance(precision, int) else 8)
-        except:
-            return round(float(price), 8)
+        m = exchange.market(symbol)
+        tick = float(m['info']['filters'][0]['tickSize'])
+        prec = int(round(-math.log10(tick)))
+        return round(price, prec)
+    except:
+        return price
 
 def round_amount(symbol, amt):
     try:
         return float(exchange.amount_to_precision(symbol, amt))
-    except Exception as e:
-        logging.warning(f"Amount rounding failed for {symbol}: {e}")
-        return float(amt)
-
-def get_wick_signal(candle):
-    if body_pct(candle) < 0.5:
-        return None, None, False
-
-    upper = upper_wick_pct(candle)
-    lower = lower_wick_pct(candle)
-    is_green = is_bullish(candle)
-
-    if is_green:
-        if upper > 50 or (upper > 30 and lower > 30):
-            return 'sell', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", True
-        return 'buy', f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**", False
-    else:
-        if lower > 30 or (upper > 30 and lower > 30):
-            return None, None, False
-        return 'sell', f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**", False
+    except:
+        return amt
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
@@ -278,7 +277,7 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     return "\n".join(lines)
 
-# === MONITOR TP & DCA ===
+# === FIXED MONITOR ===
 async def monitor_tp_and_dca():
     while True:
         try:
@@ -318,7 +317,7 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-# === IMPROVED DCA (Spam Fixed) ===
+# === FIXED DCA WITH INSUFFICIENT HANDLING ===
 async def check_and_execute_dca(sym, tr, current_price):
     try:
         dca_stage = tr['dca_stage'] + 1
@@ -335,12 +334,6 @@ async def check_and_execute_dca(sym, tr, current_price):
         should_dca = (is_long and current_price <= dca_trigger_price) or (not is_long and current_price >= dca_trigger_price)
         if not should_dca:
             return
-
-        # === ANTI-SPAM: Cooldown ===
-        last_attempt = tr.get('last_dca_attempt', 0)
-        if time.time() - last_attempt < 30:   # Try only once every 30 seconds
-            return
-        tr['last_dca_attempt'] = time.time()
 
         side = tr['side']
         amount_raw = (capital * LEVERAGE) / current_price
@@ -372,14 +365,11 @@ async def check_and_execute_dca(sym, tr, current_price):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
     except ccxt.InsufficientFunds:
-        last_warn = tr.get('last_insufficient_warn', 0)
-        if time.time() - last_warn > 60:   # Warn only once per minute
-            warning = f"\n\n⚠️ **INSUFFICIENT FUNDS FOR DCA{dca_stage}**\nRequired: ${capital} | Balance too low"
-            msg_text = build_trade_message(tr, sym) + warning
-            if tr.get('msg_id_initial'):
-                await edit_telegram_message(tr['msg_id_initial'], msg_text)
-            logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
-            tr['last_insufficient_warn'] = time.time()
+        warning = f"\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not execute DCA{dca_stage} | Required: ${capital}"
+        msg_text = build_trade_message(tr, sym) + warning
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+        logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
 
     except Exception as e:
         logging.error(f"DCA failed on {sym}: {e}")
@@ -414,7 +404,7 @@ async def close_trade(sym, hit_type, exit_price):
     except Exception as e:
         logging.error(f"Close trade failed {sym}: {e}")
 
-# === PROCESS SYMBOL ===
+# === PROCESS SYMBOL WITH INSUFFICIENT HANDLING ===
 async def process_symbol(symbol, timeframe):
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
@@ -480,9 +470,7 @@ async def process_symbol(symbol, timeframe):
             'pattern': pattern,
             'is_reversal': is_reversal,
             'dca1_level': round_price(symbol, dca1_level),
-            'dca2_level': round_price(symbol, dca2_level),
-            'last_dca_attempt': 0,           # Added for anti-spam
-            'last_insufficient_warn': 0      # Added for anti-spam
+            'dca2_level': round_price(symbol, dca2_level)
         }
 
         msg_text = build_trade_message(initial_trade, symbol)
@@ -496,6 +484,7 @@ async def process_symbol(symbol, timeframe):
         logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'}")
 
     except ccxt.InsufficientFunds:
+        # Still show the trade setup with warning
         warning = "\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not open position. Required: \~$10"
         msg_text = build_trade_message(initial_trade, symbol) + warning if 'initial_trade' in locals() else f"**Signal on {symbol}**\n⚠️ **INSUFFICIENT FUNDS**"
         await send_telegram(msg_text)

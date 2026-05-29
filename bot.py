@@ -318,7 +318,7 @@ async def monitor_tp_and_dca():
             logging.error(f"Monitor loop error: {e}")
             await asyncio.sleep(1)
 
-# === DCA ===
+# === IMPROVED DCA (Spam Fixed) ===
 async def check_and_execute_dca(sym, tr, current_price):
     try:
         dca_stage = tr['dca_stage'] + 1
@@ -335,6 +335,12 @@ async def check_and_execute_dca(sym, tr, current_price):
         should_dca = (is_long and current_price <= dca_trigger_price) or (not is_long and current_price >= dca_trigger_price)
         if not should_dca:
             return
+
+        # === ANTI-SPAM: Cooldown ===
+        last_attempt = tr.get('last_dca_attempt', 0)
+        if time.time() - last_attempt < 30:   # Try only once every 30 seconds
+            return
+        tr['last_dca_attempt'] = time.time()
 
         side = tr['side']
         amount_raw = (capital * LEVERAGE) / current_price
@@ -366,11 +372,14 @@ async def check_and_execute_dca(sym, tr, current_price):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
     except ccxt.InsufficientFunds:
-        warning = f"\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not execute DCA{dca_stage} | Required: ${capital}"
-        msg_text = build_trade_message(tr, sym) + warning
-        if tr.get('msg_id_initial'):
-            await edit_telegram_message(tr['msg_id_initial'], msg_text)
-        logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
+        last_warn = tr.get('last_insufficient_warn', 0)
+        if time.time() - last_warn > 60:   # Warn only once per minute
+            warning = f"\n\n⚠️ **INSUFFICIENT FUNDS FOR DCA{dca_stage}**\nRequired: ${capital} | Balance too low"
+            msg_text = build_trade_message(tr, sym) + warning
+            if tr.get('msg_id_initial'):
+                await edit_telegram_message(tr['msg_id_initial'], msg_text)
+            logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
+            tr['last_insufficient_warn'] = time.time()
 
     except Exception as e:
         logging.error(f"DCA failed on {sym}: {e}")
@@ -471,7 +480,9 @@ async def process_symbol(symbol, timeframe):
             'pattern': pattern,
             'is_reversal': is_reversal,
             'dca1_level': round_price(symbol, dca1_level),
-            'dca2_level': round_price(symbol, dca2_level)
+            'dca2_level': round_price(symbol, dca2_level),
+            'last_dca_attempt': 0,           # Added for anti-spam
+            'last_insufficient_warn': 0      # Added for anti-spam
         }
 
         msg_text = build_trade_message(initial_trade, symbol)

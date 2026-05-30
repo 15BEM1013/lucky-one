@@ -384,14 +384,22 @@ async def check_and_execute_dca(sym, tr, current_price):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
     except ccxt.InsufficientFunds:
-        warning = f"\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not execute DCA{dca_stage} | Required: ${capital}"
-        msg_text = build_trade_message(tr, sym) + warning
-        if tr.get('msg_id_initial'):
-            await edit_telegram_message(tr['msg_id_initial'], msg_text)
-        logging.warning(f"Insufficient funds for DCA{dca_stage} on {sym}")
 
-    except Exception as e:
-        logging.error(f"DCA failed on {sym}: {e}")
+    await send_telegram(
+        f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+        f"Symbol: {sym}\n"
+        f"Stage: DCA{dca_stage}\n"
+        f"Required Margin: ${capital}\n"
+        f"Current Price: {current_price:.6f}\n"
+        f"Trade remains active."
+    )
+
+    logging.warning(
+        f"Insufficient funds for DCA{dca_stage} on {sym}"
+    )
+
+except Exception as e:
+    logging.error(f"DCA failed on {sym}: {e}")
 
 async def close_trade(sym, hit_type, exit_price):
     try:
@@ -503,14 +511,20 @@ async def process_symbol(symbol, timeframe):
         logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'}")
 
     except ccxt.InsufficientFunds:
-        # Still show the trade setup with warning
-        warning = "\n\n⚠️ **INSUFFICIENT FUNDS**\nCould not open position. Required: \~$10"
-        msg_text = build_trade_message(initial_trade, symbol) + warning if 'initial_trade' in locals() else f"**Signal on {symbol}**\n⚠️ **INSUFFICIENT FUNDS**"
-        await send_telegram(msg_text)
-        logging.warning(f"Insufficient funds for initial trade on {symbol}")
 
-    except Exception as e:
-        logging.error(f"Trade failed {symbol}: {e}")
+    await send_telegram(
+        f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+        f"Symbol: {symbol}\n"
+        f"Could not open Initial Position\n"
+        f"Required Margin: ${CAPITAL_INITIAL}"
+    )
+
+    logging.warning(
+        f"Insufficient funds for initial trade on {symbol}"
+    )
+
+except Exception as e:
+    logging.error(f"Trade failed {symbol}: {e}")
 
 # === SCANNING ===
 async def process_batch(symbols_chunk, timeframe):

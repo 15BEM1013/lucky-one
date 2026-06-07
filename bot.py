@@ -619,47 +619,54 @@ async def process_symbol(symbol, timeframe):
 
     except ccxt.InsufficientFunds:
 
-    tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
+        tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
 
-    tp = round_price(
-        symbol,
-        entry_price * (1 + tp_pct)
-        if side == "buy"
-        else entry_price * (1 - tp_pct)
-    )
-
-    if is_reversal:
-        dca1_level = (
-            entry_price * (1 + 0.01)
-            if side == "sell"
-            else entry_price * (1 - 0.01)
-        )
-
-        dca2_level = (
-            dca1_level * (1 + DCA2_TRIGGER_PCT)
-            if side == "sell"
-            else dca1_level * (1 - DCA2_TRIGGER_PCT)
-        )
-    else:
-        dca1_level = big_open
-
-        dca2_level = (
-            big_open * (1 - DCA2_TRIGGER_PCT)
+        tp = round_price(
+            symbol,
+            entry_price * (1 + tp_pct)
             if side == "buy"
-            else big_open * (1 + DCA2_TRIGGER_PCT)
+            else entry_price * (1 - tp_pct)
         )
 
-    await send_telegram(
-        f"⚠️ *INSUFFICIENT FUNDS*\n\n"
-        f"Symbol: {symbol}\n"
-        f"Side: {side.upper()}\n"
-        f"Pattern: {pattern}\n\n"
-        f"Entry: {entry_price:.6f}\n"
-        f"TP: {tp:.6f}\n"
-        f"DCA1: {dca1_level:.6f}\n"
+        if is_reversal:
+            dca1_level = (
+                entry_price * (1 + 0.01)
+                if side == "sell"
+                else entry_price * (1 - 0.01)
+            )
+
+            dca2_level = (
+                dca1_level * (1 + DCA2_TRIGGER_PCT)
+                if side == "sell"
+                else dca1_level * (1 - DCA2_TRIGGER_PCT)
+            )
+        else:
+            dca1_level = big_open
+
+            dca2_level = (
+                big_open * (1 - DCA2_TRIGGER_PCT)
+                if side == "buy"
+                else big_open * (1 + DCA2_TRIGGER_PCT)
+            )
+
+        await send_telegram(
+            f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side.upper()}\n"
+            f"Pattern: {pattern}\n\n"
+            f"Entry: {entry_price:.6f}\n"
+            f"TP: {tp:.6f}\n"
+            f"DCA1: {dca1_level:.6f}\n"
+            f"DCA2: {dca2_level:.6f}\n\n"
+            f"Required Margin: ${CAPITAL_INITIAL}"
+        )
+
+        logging.warning(
+            f"Insufficient funds for initial trade on {symbol}"
+        )
 
 except Exception as e:
-    logging.error(f"Trade failed {symbol}: {e}")
+        logging.error(f"Trade failed {symbol}: {e}")
 
 # === SCANNING ===
 async def process_batch(symbols_chunk, timeframe):

@@ -392,7 +392,7 @@ async def check_and_execute_dca(sym, tr, current_price):
         logging.info(f"DCA{dca_stage} executed on {sym} @ {filled_price}")
 
         msg_text = build_trade_message(tr, sym)
-        if tr.get('msg_id_initial'):
+   if tr.get('msg_id_initial'):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
 except ccxt.InsufficientFunds:

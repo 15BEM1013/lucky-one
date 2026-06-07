@@ -416,6 +416,8 @@ async def check_and_execute_dca(sym, tr, current_price):
             else avg_entry * (1 - tp_pct)
         )
 
+        save_trades()
+
         logging.info(
             f"DCA{dca_stage} executed on {sym} @ {filled_price}"
         )
@@ -430,25 +432,27 @@ async def check_and_execute_dca(sym, tr, current_price):
 
     except ccxt.InsufficientFunds:
 
-    warning_key = f"dca{dca_stage}_warning_sent"
+        warning_key = f"dca{dca_stage}_warning_sent"
 
-    if not tr.get(warning_key, False):
+        if not tr.get(warning_key, False):
 
-        tr[warning_key] = True
-        save_trades()
+            tr[warning_key] = True
+            save_trades()
 
-        await send_telegram(
-            f"⚠️ *INSUFFICIENT FUNDS*\n\n"
-            f"Symbol: {sym}\n"
-            f"Stage: DCA{dca_stage}\n"
-            f"Required Margin: ${capital}\n"
-            f"Current Price: {current_price:.6f}\n"
-            f"Trade remains active."
-        )
+            await send_telegram(
+                f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+                f"Symbol: {sym}\n"
+                f"Stage: DCA{dca_stage}\n"
+                f"Required Margin: ${capital}\n"
+                f"Current Price: {current_price:.6f}\n"
+                f"Trade remains active."
+            )
 
-        logging.warning(
-            f"Insufficient funds for DCA{dca_stage} on {sym}"
-        )
+            logging.warning(
+                f"Insufficient funds for DCA{dca_stage} on {sym}"
+            )
+
+        return
 
     except Exception as e:
         logging.error(

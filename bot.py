@@ -395,23 +395,23 @@ async def check_and_execute_dca(sym, tr, current_price):
         if tr.get('msg_id_initial'):
             await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
-    except ccxt.InsufficientFunds:
+except ccxt.InsufficientFunds:
 
-    await send_telegram(
-        f"⚠️ *INSUFFICIENT FUNDS*\n\n"
-        f"Symbol: {sym}\n"
-        f"Stage: DCA{dca_stage}\n"
-        f"Required Margin: ${capital}\n"
-        f"Current Price: {current_price:.6f}\n"
-        f"Trade remains active."
-    )
+        await send_telegram(
+            f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+            f"Symbol: {sym}\n"
+            f"Stage: DCA{dca_stage}\n"
+            f"Required Margin: ${capital}\n"
+            f"Current Price: {current_price:.6f}\n"
+            f"Trade remains active."
+        )
 
-    logging.warning(
-        f"Insufficient funds for DCA{dca_stage} on {sym}"
-    )
+        logging.warning(
+            f"Insufficient funds for DCA{dca_stage} on {sym}"
+        )
 
-except Exception as e:
-    logging.error(f"DCA failed on {sym}: {e}")
+    except Exception as e:
+        logging.error(f"DCA failed on {sym}: {e}")
 async def close_trade(sym, hit_type, exit_price):
     try:
         tr = open_trades[sym]
@@ -665,7 +665,7 @@ async def process_symbol(symbol, timeframe):
             f"Insufficient funds for initial trade on {symbol}"
         )
 
-except Exception as e:
+    except Exception as e:
         logging.error(f"Trade failed {symbol}: {e}")
 
 # === SCANNING ===

@@ -131,6 +131,9 @@ exchange = None
 sent_signals = {}
 open_trades = {}
 
+eth_trend = "SIDEWAYS"
+eth_last_candle = None
+
 # === HELPERS ===
 def format_duration(seconds):
     if seconds < 60: return f"{int(seconds)}s"
@@ -213,6 +216,15 @@ def round_amount(symbol, amt):
         return float(exchange.amount_to_precision(symbol, amt))
     except:
         return amt
+def calculate_ema(prices, period):
+    multiplier = 2 / (period + 1)
+
+    ema = sum(prices[:period]) / period
+
+    for price in prices[period:]:
+        ema = ((price - ema) * multiplier) + ema
+
+    return ema
 
 # === PATTERN DETECTION ===
 def detect_rising_three(candles):
@@ -431,6 +443,76 @@ async def close_trade(sym, hit_type, exit_price):
     except Exception as e:
         logging.error(f"Close trade failed {sym}: {e}")
 
+
+async def update_eth_trend():
+    global eth_trend, eth_last_candle
+
+    try:
+        candles = await exchange.fetch_ohlcv(
+            'ETH/USDT:USDT',
+            '1h',
+            limit=50
+        )
+
+        closed_candles = candles[:-1]
+
+        current_closed = closed_candles[-1][0]
+
+        if current_closed == eth_last_candle:
+            return
+
+        closes = [c[4] for c in closed_candles]
+
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
+
+        ema21_prev = calculate_ema(closes[:-1], 21)
+
+        eth_close = closes[-1]
+
+        ema_diff_pct = abs(ema9 - ema21) / ema21 * 100
+
+        if (
+            ema9 > ema21 and
+            eth_close > ema21 and
+            ema21 > ema21_prev and
+            ema_diff_pct >= 0.30
+        ):
+            eth_trend = "BULLISH"
+
+        elif (
+            ema9 < ema21 and
+            eth_close < ema21 and
+            ema21 < ema21_prev and
+            ema_diff_pct >= 0.30
+        ):
+            eth_trend = "BEARISH"
+
+        else:
+            eth_trend = "SIDEWAYS"
+
+        eth_last_candle = current_closed
+
+        await send_telegram(
+            f"📊 ETH FILTER\n\n"
+            f"Trend: {eth_trend}\n"
+            f"EMA9: {ema9:.2f}\n"
+            f"EMA21: {ema21:.2f}\n"
+            f"EMA Diff: {ema_diff_pct:.2f}%"
+        )
+
+    except Exception as e:
+        logging.error(f"ETH trend error: {e}")
+
+async def eth_filter_loop():
+    while True:
+        try:
+            await update_eth_trend()
+            await asyncio.sleep(60)
+        except Exception as e:
+            logging.error(f"ETH loop error: {e}")
+            await asyncio.sleep(60)
+
 # === PROCESS SYMBOL WITH INSUFFICIENT HANDLING ===
 async def process_symbol(symbol, timeframe):
     try:
@@ -460,6 +542,31 @@ async def process_symbol(symbol, timeframe):
 
         if not side: return
 
+
+# ==========================
+# ETH FILTER
+# ==========================
+
+if eth_trend == "BULLISH":
+
+    # Reject Falling Three continuation sells
+    if pattern == "Falling Three":
+        logging.info(f"{symbol} rejected - ETH bullish")
+        return
+
+elif eth_trend == "BEARISH":
+
+    # Reject Rising Three BUY only
+    if pattern == "Rising Three" and side == "buy":
+        logging.info(f"{symbol} rejected - ETH bearish")
+        return
+
+elif eth_trend == "SIDEWAYS":
+
+    # Reject all BUYs
+    if side == "buy":
+        logging.info(f"{symbol} rejected - ETH sideways")
+        return
         sent_signals[key] = signal_time
         await prepare_symbol(symbol)
 
@@ -579,6 +686,7 @@ async def main():
     markets = exchange.markets
     symbols = get_symbols(markets)
     load_trades()
+await update_eth_trend()
 
     logging.info(f"Starting bot with {len(symbols)} symbols")
 
@@ -586,10 +694,11 @@ async def main():
     await send_telegram(startup_msg)
 
     tasks = [
-        asyncio.create_task(scan_loop(symbols)),
-        asyncio.create_task(monitor_tp_and_dca()),
-        asyncio.create_task(daily_summary()),
-    ]
+    asyncio.create_task(scan_loop(symbols)),
+    asyncio.create_task(monitor_tp_and_dca()),
+    asyncio.create_task(daily_summary()),
+    asyncio.create_task(eth_filter_loop()),
+]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":

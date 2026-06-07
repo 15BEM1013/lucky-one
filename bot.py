@@ -362,17 +362,33 @@ async def check_and_execute_dca(sym, tr, current_price):
             dca_trigger_price = tr['dca2_level']
             capital = CAPITAL_DCA2
 
-        should_dca = (is_long and current_price <= dca_trigger_price) or (not is_long and current_price >= dca_trigger_price)
+        should_dca = (
+            (is_long and current_price <= dca_trigger_price)
+            or
+            (not is_long and current_price >= dca_trigger_price)
+        )
+
         if not should_dca:
             return
 
         side = tr['side']
+
         amount_raw = (capital * LEVERAGE) / current_price
         amount = round_amount(sym, amount_raw)
-        if amount <= 0: return
 
-        order = await exchange.create_market_order(sym, side, amount)
-        filled_price = round_price(sym, order.get('average') or current_price)
+        if amount <= 0:
+            return
+
+        order = await exchange.create_market_order(
+            sym,
+            side,
+            amount
+        )
+
+        filled_price = round_price(
+            sym,
+            order.get('average') or current_price
+        )
 
         tr['entries'].append({
             'price': filled_price,
@@ -383,19 +399,36 @@ async def check_and_execute_dca(sym, tr, current_price):
         })
 
         avg_entry, _ = get_avg_entry_and_total(tr)
+
         tr['avg_entry'] = avg_entry
         tr['dca_stage'] = dca_stage
 
-        tp_pct = TP_AFTER_DCA1_PCT if dca_stage == 1 else TP_AFTER_DCA2_PCT
-        tr['tp'] = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
+        tp_pct = (
+            TP_AFTER_DCA1_PCT
+            if dca_stage == 1
+            else TP_AFTER_DCA2_PCT
+        )
 
-        logging.info(f"DCA{dca_stage} executed on {sym} @ {filled_price}")
+        tr['tp'] = round_price(
+            sym,
+            avg_entry * (1 + tp_pct)
+            if is_long
+            else avg_entry * (1 - tp_pct)
+        )
+
+        logging.info(
+            f"DCA{dca_stage} executed on {sym} @ {filled_price}"
+        )
 
         msg_text = build_trade_message(tr, sym)
-   if tr.get('msg_id_initial'):
-            await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
-except ccxt.InsufficientFunds:
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(
+                tr['msg_id_initial'],
+                msg_text
+            )
+
+    except ccxt.InsufficientFunds:
 
         await send_telegram(
             f"⚠️ *INSUFFICIENT FUNDS*\n\n"
@@ -411,7 +444,9 @@ except ccxt.InsufficientFunds:
         )
 
     except Exception as e:
-        logging.error(f"DCA failed on {sym}: {e}")
+        logging.error(
+            f"DCA failed on {sym}: {e}"
+        )
 async def close_trade(sym, hit_type, exit_price):
     try:
         tr = open_trades[sym]

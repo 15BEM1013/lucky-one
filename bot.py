@@ -399,23 +399,19 @@ async def check_and_execute_dca(sym, tr, current_price):
 
     await send_telegram(
         f"⚠️ *INSUFFICIENT FUNDS*\n\n"
-        f"Symbol: {symbol}\n"
-        f"Side: {side.upper()}\n"
-        f"Pattern: {pattern}\n\n"
-        f"Entry: {entry_price:.6f}\n"
-        f"TP: {tp:.6f}\n"
-        f"DCA1: {dca1_level:.6f}\n"
-        f"DCA2: {dca2_level:.6f}\n\n"
-        f"Required Margin: ${CAPITAL_INITIAL}"
+        f"Symbol: {sym}\n"
+        f"Stage: DCA{dca_stage}\n"
+        f"Required Margin: ${capital}\n"
+        f"Current Price: {current_price:.6f}\n"
+        f"Trade remains active."
     )
 
     logging.warning(
-        f"Insufficient funds for initial trade on {symbol}"
+        f"Insufficient funds for DCA{dca_stage} on {sym}"
     )
 
 except Exception as e:
-    logging.error(f"Trade failed {symbol}: {e}")
-
+    logging.error(f"DCA failed on {sym}: {e}")
 async def close_trade(sym, hit_type, exit_price):
     try:
         tr = open_trades[sym]

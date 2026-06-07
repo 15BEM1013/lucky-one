@@ -635,33 +635,32 @@ async def process_symbol(symbol, timeframe):
         else:
             dca1_level = big_open
             dca2_level = big_open * (1 - DCA2_TRIGGER_PCT) if side == 'buy' else big_open * (1 + DCA2_TRIGGER_PCT)
+        initial_trade = {
+            'side': side,
+            'initial_price': filled_price,
+            'entries': [{
+                'price': filled_price,
+                'amount': amount,
+                'margin': CAPITAL_INITIAL,
+                'ts': time.time(),
+                'stage': 0
+            }],
+            'avg_entry': filled_price,
+            'tp': tp,
+            'dca_stage': 0,
 
-      initial_trade = {
-    'side': side,
-    'initial_price': filled_price,
-    'entries': [{
-        'price': filled_price,
-        'amount': amount,
-        'margin': CAPITAL_INITIAL,
-        'ts': time.time(),
-        'stage': 0
-    }],
-    'avg_entry': filled_price,
-    'tp': tp,
-    'dca_stage': 0,
+            'dca1_warning_sent': False,
+            'dca2_warning_sent': False,
 
-    'dca1_warning_sent': False,
-    'dca2_warning_sent': False,
-
-    'msg_id_initial': None,
-    'open_ts': time.time(),
-    'timeframe': timeframe,
-    'signal_reason': signal_msg,
-    'pattern': pattern,
-    'is_reversal': is_reversal,
-    'dca1_level': round_price(symbol, dca1_level),
-    'dca2_level': round_price(symbol, dca2_level)
-}
+            'msg_id_initial': None,
+            'open_ts': time.time(),
+            'timeframe': timeframe,
+            'signal_reason': signal_msg,
+            'pattern': pattern,
+            'is_reversal': is_reversal,
+            'dca1_level': round_price(symbol, dca1_level),
+            'dca2_level': round_price(symbol, dca2_level)
+        }
 
         msg_text = build_trade_message(initial_trade, symbol)
         mid = await send_telegram(msg_text)

@@ -563,14 +563,14 @@ elif eth_trend == "BEARISH":
 
 elif eth_trend == "SIDEWAYS":
 
-    # Reject all BUYs
     if side == "buy":
         logging.info(f"{symbol} rejected - ETH sideways")
         return
-        sent_signals[key] = signal_time
-        await prepare_symbol(symbol)
 
-        ticker = await exchange.fetch_ticker(symbol)
+sent_signals[key] = signal_time
+await prepare_symbol(symbol)
+
+ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price

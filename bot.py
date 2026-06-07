@@ -544,33 +544,34 @@ async def process_symbol(symbol, timeframe):
 
 
 # ==========================
-# ETH FILTER
-# ==========================
+        # ETH FILTER
+        # ==========================
 
-if eth_trend == "BULLISH":
+        if eth_trend == "BULLISH":
 
-    # Reject Falling Three continuation sells
-    if pattern == "Falling Three":
-        logging.info(f"{symbol} rejected - ETH bullish")
-        return
+            # Reject Falling Three continuation sells
+            if pattern == "Falling Three":
+                logging.info(f"{symbol} rejected - ETH bullish")
+                return
 
-elif eth_trend == "BEARISH":
+        elif eth_trend == "BEARISH":
 
-    # Reject Rising Three BUY only
-    if pattern == "Rising Three" and side == "buy":
-        logging.info(f"{symbol} rejected - ETH bearish")
-        return
+            # Reject Rising Three BUY only
+            if pattern == "Rising Three" and side == "buy":
+                logging.info(f"{symbol} rejected - ETH bearish")
+                return
 
-elif eth_trend == "SIDEWAYS":
+        elif eth_trend == "SIDEWAYS":
 
-    if side == "buy":
-        logging.info(f"{symbol} rejected - ETH sideways")
-        return
+            # Reject all BUYs
+            if side == "buy":
+                logging.info(f"{symbol} rejected - ETH sideways")
+                return
 
-sent_signals[key] = signal_time
-await prepare_symbol(symbol)
+        sent_signals[key] = signal_time
+        await prepare_symbol(symbol)
 
-ticker = await exchange.fetch_ticker(symbol)
+        ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
@@ -619,16 +620,44 @@ ticker = await exchange.fetch_ticker(symbol)
 
     except ccxt.InsufficientFunds:
 
+    tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
+
+    tp = round_price(
+        symbol,
+        entry_price * (1 + tp_pct)
+        if side == "buy"
+        else entry_price * (1 - tp_pct)
+    )
+
+    if is_reversal:
+        dca1_level = (
+            entry_price * (1 + 0.01)
+            if side == "sell"
+            else entry_price * (1 - 0.01)
+        )
+
+        dca2_level = (
+            dca1_level * (1 + DCA2_TRIGGER_PCT)
+            if side == "sell"
+            else dca1_level * (1 - DCA2_TRIGGER_PCT)
+        )
+    else:
+        dca1_level = big_open
+
+        dca2_level = (
+            big_open * (1 - DCA2_TRIGGER_PCT)
+            if side == "buy"
+            else big_open * (1 + DCA2_TRIGGER_PCT)
+        )
+
     await send_telegram(
         f"⚠️ *INSUFFICIENT FUNDS*\n\n"
         f"Symbol: {symbol}\n"
-        f"Could not open Initial Position\n"
-        f"Required Margin: ${CAPITAL_INITIAL}"
-    )
-
-    logging.warning(
-        f"Insufficient funds for initial trade on {symbol}"
-    )
+        f"Side: {side.upper()}\n"
+        f"Pattern: {pattern}\n\n"
+        f"Entry: {entry_price:.6f}\n"
+        f"TP: {tp:.6f}\n"
+        f"DCA1: {dca1_level:.6f}\n"
 
 except Exception as e:
     logging.error(f"Trade failed {symbol}: {e}")
@@ -686,7 +715,7 @@ async def main():
     markets = exchange.markets
     symbols = get_symbols(markets)
     load_trades()
-await update_eth_trend()
+    await update_eth_trend()
 
     logging.info(f"Starting bot with {len(symbols)} symbols")
 

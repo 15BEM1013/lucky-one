@@ -170,38 +170,37 @@ def get_wick_signal(candle):
     lower = lower_wick_pct(candle)
     is_green = is_bullish(candle)
 
-    # === GREEN CANDLE LOGIC ===
+    # GREEN CANDLE
     if is_green:
 
-        # Strong upper rejection → reversal SELL
-        if upper > 50 or (upper > 30 and lower > 30):
+        if (
+            upper > 50
+            or lower > 30
+            or (upper > 30 and lower > 30)
+        ):
             return (
                 'sell',
-                f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**",
+                f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → SELL",
                 True
             )
 
-        # Normal bullish continuation
         return (
             'buy',
-            f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **BUY**",
+            f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → BUY",
             False
         )
 
-    # === RED CANDLE LOGIC ===
+    # RED CANDLE
     else:
 
-        # Block strong rejection red candles completely
         if lower > 30 or (upper > 30 and lower > 30):
             return None, None, False
 
-        # Normal bearish continuation
         return (
             'sell',
-            f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → **SELL**",
+            f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → SELL",
             False
         )
-
 def round_price(symbol, price):
     try:
         m = exchange.market(symbol)
@@ -585,32 +584,34 @@ async def process_symbol(symbol, timeframe):
         else:
             return
 
-        if not side: return
-
+        if not side:
+            return
 
 # ==========================
-        # ETH FILTER
-        # ==========================
+# ETH FILTER
+# ==========================
 
         if eth_trend == "BULLISH":
 
-            # Reject Falling Three continuation sells
-            if pattern == "Falling Three":
+            # Block only Falling Three continuation sells
+            if pattern == "Falling Three" and not is_reversal:
                 logging.info(f"{symbol} rejected - ETH bullish")
                 return
 
         elif eth_trend == "BEARISH":
 
-            # Reject Rising Three BUY only
+            # Block Rising Three BUY continuation
             if pattern == "Rising Three" and side == "buy":
                 logging.info(f"{symbol} rejected - ETH bearish")
                 return
 
         elif eth_trend == "SIDEWAYS":
 
-            # Reject all BUYs
-            if side == "buy":
-                logging.info(f"{symbol} rejected - ETH sideways")
+            # Allow ONLY reversal SELL trades
+            if not (side == "sell" and is_reversal):
+                logging.info(
+                    f"{symbol} rejected - ETH sideways (only reversal SELL allowed)"
+                )
                 return
 
         sent_signals[key] = signal_time

@@ -135,6 +135,10 @@ eth_trend = "SIDEWAYS"
 eth_phase = "INDECISION"
 eth_last_candle = None
 
+eth_ema9 = 0.0
+eth_ema21 = 0.0
+eth_ema_gap = 0.0
+
 # ===========================
 # ETH MARKET PHASE ANALYSIS
 # ===========================
@@ -637,6 +641,9 @@ async def update_eth_trend():
     global eth_last_candle
     global eth_market_phases
     global eth_phase_text
+    global eth_ema9
+    global eth_ema21
+    global eth_ema_gap
 
     try:
 
@@ -720,8 +727,14 @@ async def update_eth_trend():
             "end": phase_history[-1]["time"],
             "phase": current_phase
         })
-
         latest = eth_market_phases[-1]["phase"]
+
+        # ==========================
+        # Save latest EMA values
+        # ==========================
+        eth_ema9 = calculate_ema(closes, 9)
+        eth_ema21 = calculate_ema(closes, 21)
+        eth_ema_gap = abs(eth_ema9 - eth_ema21) / eth_ema21 * 100
 
         if latest == "🔴 Bearish Momentum Building":
             eth_phase = "BEARISH_MOMENTUM"
@@ -758,17 +771,23 @@ async def update_eth_trend():
 
         next_phase, confidence = predict_next_phase(latest)
 
-        text = "📊 ETH MARKET PHASE (Last Hours)\n\n"
+        text = (
+    f"📊 ETH FILTER\n"
+    f"Trend: {eth_trend}\n"
+    f"EMA9: {eth_ema9:.2f}\n"
+    f"EMA21: {eth_ema21:.2f}\n"
+    f"EMA Gap: {eth_ema_gap:.2f}%\n\n"
+)
+        text += "📊 ETH MARKET PHASE (Last Hours)\n\n"
 
         for p in eth_market_phases[-4:]:
-
             s = datetime.fromtimestamp(
-                p["start"]/1000,
+                p["start"] / 1000,
                 pytz.timezone("Asia/Kolkata")
             ).strftime("%H:%M")
 
             e = datetime.fromtimestamp(
-                p["end"]/1000,
+                p["end"] / 1000,
                 pytz.timezone("Asia/Kolkata")
             ).strftime("%H:%M")
 
@@ -829,74 +848,42 @@ async def process_symbol(symbol, timeframe):
         if not side:
             return
 # ==========================
-# ETH MARKET PHASE FILTER
+# ETH FILTER
 # ==========================
+        if eth_trend == "BULLISH":
 
-        # Strong Bearish
-        if eth_phase == "BEARISH_MOMENTUM":
+            # Rising continuation
+            if pattern == "Rising Three" and not is_reversal:
+                pass
 
-            # Allow only SELL continuation
-            if side == "buy":
-                logging.info(f"{symbol} rejected - Strong Bearish Phase")
+            elif pattern == "Rising Three" and is_reversal:
+                pass
+
+            else:
+                logging.info(f"{symbol} rejected - Bullish")
                 return
 
-        # Bearish weakening
-        elif eth_phase == "BEARISH_FADING":
+        elif eth_trend == "SIDEWAYS":
 
-            # Allow SELL continuation + BUY reversal only
-            if side == "buy" and not is_reversal:
-                logging.info(f"{symbol} rejected - Bearish Fading")
+            if pattern == "Rising Three" and not is_reversal:
+                side = "sell"
+            else:
+                logging.info(f"{symbol} rejected - Sideways")
                 return
 
-        # Sideways with bullish bias
-        elif eth_phase == "SIDEWAYS_BULLISH":
+        elif eth_trend == "BEARISH":
 
-            # Allow only BUY trades
-            if side != "buy":
-                logging.info(f"{symbol} rejected - Sideways Bullish")
+            if eth_ema_gap > 1.0:
+                logging.info(f"{symbol} rejected - EMA Gap > 1%")
                 return
 
-        # Strong Bullish
-        elif eth_phase == "BULLISH_MOMENTUM":
-
-            # Allow only BUY continuation
-            if side == "sell":
-                logging.info(f"{symbol} rejected - Strong Bullish")
+            if pattern == "Falling Three" and not is_reversal:
+                pass
+            else:
+                logging.info(f"{symbol} rejected - Bearish")
                 return
 
-        # Bullish weakening
-        elif eth_phase == "BULLISH_FADING":
-
-            # Allow BUY continuation + SELL reversal
-            if side == "sell" and not is_reversal:
-                logging.info(f"{symbol} rejected - Bullish Fading")
-                return
-
-        # Sideways with bearish bias
-        elif eth_phase == "SIDEWAYS_BEARISH":
-
-            # Allow only SELL trades
-            if side != "sell":
-                logging.info(f"{symbol} rejected - Sideways Bearish")
-                return
-
-        # Market transition
-        elif eth_phase == "TRANSITION":
-
-            # Allow only reversal trades
-            if not is_reversal:
-                logging.info(f"{symbol} rejected - Transition Phase")
-                return
-
-        # Complete indecision
-        elif eth_phase == "INDECISION":
-
-            logging.info(f"{symbol} rejected - Indecision")
-            return
-
-        sent_signals[key] = signal_time
         await prepare_symbol(symbol)
-
         ticker = await exchange.fetch_ticker(symbol)
         entry_price = round_price(symbol, ticker['last'])
 

@@ -638,7 +638,7 @@ async def update_eth_trend():
     global eth_market_phases
     global eth_phase_text
 
-        try:
+    try:
 
         candles = await exchange.fetch_ohlcv(
             "ETH/USDT:USDT",

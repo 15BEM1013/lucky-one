@@ -638,7 +638,7 @@ async def update_eth_trend():
     global eth_market_phases
     global eth_phase_text
 
-    try:
+        try:
 
         candles = await exchange.fetch_ohlcv(
             "ETH/USDT:USDT",
@@ -659,7 +659,7 @@ async def update_eth_trend():
 
         for i in range(21, len(closes)):
 
-            price = closes[:i+1]
+            price = closes[:i + 1]
 
             ema9 = calculate_ema(price, 9)
             ema21 = calculate_ema(price, 21)
@@ -716,12 +716,12 @@ async def update_eth_trend():
                 current_phase = p["phase"]
 
         eth_market_phases.append({
-    "start": start_time,
-    "end": phase_history[-1]["time"],
-    "phase": current_phase
-})
+            "start": start_time,
+            "end": phase_history[-1]["time"],
+            "phase": current_phase
+        })
 
-latest = eth_market_phases[-1]["phase"]
+        latest = eth_market_phases[-1]["phase"]
 
         if latest == "🔴 Bearish Momentum Building":
             eth_phase = "BEARISH_MOMENTUM"

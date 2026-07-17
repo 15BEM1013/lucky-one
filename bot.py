@@ -873,15 +873,8 @@ async def process_symbol(symbol, timeframe):
 
         elif eth_trend == "BEARISH":
 
-            if eth_ema_gap > 1.0:
-                logging.info(f"{symbol} rejected - EMA Gap > 1%")
-                return
-
-            if pattern == "Falling Three" and not is_reversal:
-                pass
-            else:
-                logging.info(f"{symbol} rejected - Bearish")
-                return
+            logging.info(f"{symbol} rejected - Bearish")
+            return
 
         await prepare_symbol(symbol)
         ticker = await exchange.fetch_ticker(symbol)

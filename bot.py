@@ -894,8 +894,7 @@ async def process_symbol(symbol, timeframe):
         elif eth_trend == "SIDEWAYS":
             tp_pct = 0.75 / 100
         else:
-            tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal 
-   else TP_INITIAL_NORMAL_PCT
+            tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
         tp = round_price(symbol, filled_price * (1 + tp_pct) if side == 'buy' else filled_price * (1 - tp_pct))
 
         if is_reversal:

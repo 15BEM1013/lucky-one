@@ -830,6 +830,8 @@ async def process_symbol(symbol, timeframe):
         async with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES: return
             if sent_signals.get(key) == signal_time: return
+ 
+            sent_signals[key] = signal_time
 
         is_rising, big_candle = detect_rising_three(candles)
         is_falling, big_candle_f = detect_falling_three(candles)
@@ -887,7 +889,13 @@ async def process_symbol(symbol, timeframe):
         entry_order = await exchange.create_market_order(symbol, side, amount)
         filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
-        tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
+        if eth_trend == "BULLISH":
+            tp_pct = 1.0 / 100
+        elif eth_trend == "SIDEWAYS":
+            tp_pct = 0.75 / 100
+        else:
+            tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal 
+   else TP_INITIAL_NORMAL_PCT
         tp = round_price(symbol, filled_price * (1 + tp_pct) if side == 'buy' else filled_price * (1 - tp_pct))
 
         if is_reversal:

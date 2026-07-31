@@ -28,21 +28,25 @@ NUM_CHUNKS = 8
 CAPITAL_INITIAL = 10.0
 LEVERAGE = 9
 
-CAPITAL_DCA1_NORMAL = 20.0
-CAPITAL_DCA1_REVERSAL = 10.0
-CAPITAL_DCA2 = 5.0
+# --- Bullish-trend continuation LONG scheme ---
+BULLISH_DCA1_TRIGGER_PCT = 0.2 / 100   # big-candle open + 0.2%
+BULLISH_DCA1_CAPITAL = 20.0
+BULLISH_TP_AFTER_DCA1_PCT = 0.8 / 100  # from new avg entry
+BULLISH_SL_PCT = 3.5 / 100             # fixed, off big-candle open price
+BULLISH_TP_INITIAL_PCT = 1.0 / 100     # unchanged, no-DCA case
 
-SL_PCT = 8.0 / 100
+# --- Sideways-trend SHORT scheme (also used for bullish-reversal SHORTs) ---
+SIDEWAYS_DCA1_TRIGGER_PCT = 1.0 / 100  # from entry price
+SIDEWAYS_DCA1_CAPITAL = 20.0
+SIDEWAYS_TP_AFTER_DCA1_PCT = 0.8 / 100
+SIDEWAYS_DCA2_TRIGGER_PCT = 3.0 / 100  # from entry price (not from DCA1)
+SIDEWAYS_DCA2_CAPITAL = 10.0
+SIDEWAYS_TP_AFTER_DCA2_PCT = 0.6 / 100
+SIDEWAYS_SL_PCT = 5.0 / 100            # fixed, off entry price
+SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 
-TP_INITIAL_NORMAL_PCT = 1.0 / 100
-TP_INITIAL_REVERSAL_PCT = 0.5 / 100
-
-TP_AFTER_DCA1_PCT = 0.6 / 100
-TP_AFTER_DCA2_PCT = 0.4 / 100
-
-DCA2_TRIGGER_PCT = 1.5 / 100
-
-TP_CHECK_INTERVAL = 0.5
+TP_CHECK_INTERVAL = 0.5      # SL price-poll interval
+ORDER_CHECK_INTERVAL = 2.0   # DCA1/DCA2/TP resting-limit-order fill-check interval
 MAX_OPEN_TRADES = 5
 
 TRADE_FILE = 'open_trades.json'
@@ -130,6 +134,7 @@ async def initialize_exchange():
 exchange = None
 sent_signals = {}
 open_trades = {}
+prepared_symbols = set()  # symbols where margin mode / leverage already set this run
 
 eth_trend = "SIDEWAYS"
 eth_phase = "INDECISION"
@@ -401,9 +406,12 @@ def get_symbols(markets):
     return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
 
 async def prepare_symbol(symbol):
+    if symbol in prepared_symbols:
+        return
     try:
         await exchange.set_margin_mode('isolated', symbol)
         await exchange.set_leverage(LEVERAGE, symbol)
+        prepared_symbols.add(symbol)
     except Exception as e:
         logging.warning(f"Prepare {symbol} failed: {e}")
 
@@ -412,11 +420,53 @@ def get_avg_entry_and_total(tr):
     weighted = sum(e['price'] * e['amount'] for e in tr['entries'])
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
+# === TREND-BASED TRADE PLAN ===
+def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price):
+    """
+    Decides which DCA/TP/SL scheme a trade uses, and computes the initial
+    levels for it.
+
+    ref_price = filled_price (order succeeded) or last known ticker/entry
+    price (InsufficientFunds fallback, order never filled).
+
+    Two schemes:
+      - 'bullish_long': ETH-bullish trend, continuation LONG (Rising Three,
+        non-reversal, buy side) only.
+      - 'sideways': everything else that reaches this point — actual
+        ETH-sideways SHORTs, and ETH-bullish reversal SHORTs.
+
+    Returns: (dca_scheme, tp, dca1_level, dca2_level_or_None, sl_reference_price)
+    All price values are rounded to the symbol's tick size.
+    """
+    is_long = side == 'buy'
+    use_bullish_long_scheme = (eth_trend_now == "BULLISH" and is_long and not is_reversal)
+
+    if use_bullish_long_scheme:
+        dca_scheme = 'bullish_long'
+        tp_pct = BULLISH_TP_INITIAL_PCT
+        dca1_level = big_open * (1 + BULLISH_DCA1_TRIGGER_PCT)
+        dca2_level = None
+        sl_reference_price = big_open
+    else:
+        dca_scheme = 'sideways'
+        tp_pct = SIDEWAYS_TP_INITIAL_PCT
+        dca1_level = ref_price * (1 - SIDEWAYS_DCA1_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA1_TRIGGER_PCT)
+        dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
+        sl_reference_price = ref_price
+
+    tp = round_price(symbol, ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct))
+    dca1_level = round_price(symbol, dca1_level)
+    dca2_level = round_price(symbol, dca2_level) if dca2_level is not None else None
+    sl_reference_price = round_price(symbol, sl_reference_price)
+
+    return dca_scheme, tp, dca1_level, dca2_level, sl_reference_price
+
 # === BUILD TRADE MESSAGE ===
 def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
     is_long = tr['side'] == 'buy'
     duration = format_duration(time.time() - tr['open_ts'])
     avg = tr['avg_entry']
+    scheme = tr.get('dca_scheme', 'sideways')
 
     lines = [
         f"**{'LONG' if is_long else 'SHORT'}** {sym} ({tr.get('timeframe', 'N/A')})",
@@ -427,20 +477,16 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
     entries_str = [f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
     lines.append("Entries: " + " | ".join(entries_str))
 
-    sl_price = round_price(sym, avg * (1 - SL_PCT) if is_long else avg * (1 + SL_PCT))
-    lines.append(f"TP: {tr['tp']:.6f} | SL: {sl_price:.6f} (8%)")
+    sl_pct = BULLISH_SL_PCT if scheme == 'bullish_long' else SIDEWAYS_SL_PCT
+    sl_ref = tr.get('sl_reference_price', avg)
+    sl_price = round_price(sym, sl_ref * (1 - sl_pct) if is_long else sl_ref * (1 + sl_pct))
+    lines.append(f"TP: {tr['tp']:.6f} | SL: {sl_price:.6f} ({sl_pct*100:.1f}%)")
 
-    if tr.get('is_reversal'):
-        dca1 = tr.get('dca1_level')
-        dca2 = tr.get('dca2_level')
-        dir_symbol = "+" if not is_long else "-"
-        lines.append(f"DCA1 Level: {dca1:.6f} ({dir_symbol}1.0%)")
-        lines.append(f"DCA2 Level: {dca2:.6f} ({dir_symbol}1.5% from DCA1)")
+    if scheme == 'bullish_long':
+        lines.append(f"DCA1 Level: {tr['dca1_level']:.6f} (0.2% above big-candle open) | No DCA2")
     else:
-        dca1 = tr.get('dca1_level')
-        dca2 = tr.get('dca2_level')
-        lines.append(f"DCA1 Level: {dca1:.6f} (Big Candle Open)")
-        lines.append(f"DCA2 Level: {dca2:.6f} (1.5% from DCA1)")
+        lines.append(f"DCA1 Level: {tr['dca1_level']:.6f} (1% from entry)")
+        lines.append(f"DCA2 Level: {tr['dca2_level']:.6f} (3% from entry)")
 
     if tr.get('signal_reason'):
         lines.append(f"Signal: {tr['signal_reason']}")
@@ -454,8 +500,8 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
 
     return "\n".join(lines)
 
-# === FIXED MONITOR ===
-async def monitor_tp_and_dca():
+# === SL MONITOR (TP/DCA1/DCA2 are resting limit orders, watched by order_monitor_loop) ===
+async def sl_monitor_loop():
     while True:
         try:
             async with trade_lock:
@@ -474,142 +520,196 @@ async def monitor_tp_and_dca():
 
                     is_long = tr['side'] == 'buy'
                     avg_entry = tr['avg_entry']
-                    current_tp = tr['tp']
 
-                    sl_price = avg_entry * (1 - SL_PCT) if is_long else avg_entry * (1 + SL_PCT)
+                    scheme = tr.get('dca_scheme', 'sideways')
+                    sl_pct = BULLISH_SL_PCT if scheme == 'bullish_long' else SIDEWAYS_SL_PCT
+                    sl_ref = tr.get('sl_reference_price', avg_entry)
+                    sl_price = sl_ref * (1 - sl_pct) if is_long else sl_ref * (1 + sl_pct)
+
                     if (is_long and current <= sl_price) or (not is_long and current >= sl_price):
                         await close_trade(sym, "SL", current)
                         continue
 
-                    if (is_long and current >= current_tp) or (not is_long and current <= current_tp):
-                        await close_trade(sym, "TP", current)
-                        continue
-
-                    if tr['dca_stage'] < 2:
-                        await check_and_execute_dca(sym, tr, current)
-
             await asyncio.sleep(TP_CHECK_INTERVAL)
 
         except Exception as e:
-            logging.error(f"Monitor loop error: {e}")
+            logging.error(f"SL monitor loop error: {e}")
             await asyncio.sleep(1)
 
-# === FIXED DCA WITH INSUFFICIENT HANDLING ===
-async def check_and_execute_dca(sym, tr, current_price):
+# === RESTING LIMIT ORDER HELPERS (DCA1 / DCA2 / TP) ===
+async def safe_fetch_order(sym, order_id):
     try:
-        dca_stage = tr['dca_stage'] + 1
-        is_reversal = tr.get('is_reversal', False)
-        is_long = tr['side'] == 'buy'
+        return await exchange.fetch_order(order_id, sym)
+    except Exception as e:
+        logging.error(f"fetch_order failed {sym} {order_id}: {e}")
+        return None
 
-        if dca_stage == 1:
-            dca_trigger_price = tr['dca1_level']
-            capital = CAPITAL_DCA1_REVERSAL if is_reversal else CAPITAL_DCA1_NORMAL
-        else:
-            dca_trigger_price = tr['dca2_level']
-            capital = CAPITAL_DCA2
+async def cancel_order_safe(sym, order_id):
+    if not order_id:
+        return
+    try:
+        await exchange.cancel_order(order_id, sym)
+    except Exception as e:
+        # order may already be filled or cancelled - not fatal
+        logging.warning(f"cancel_order {sym} {order_id}: {e}")
 
-        should_dca = (
-            (is_long and current_price <= dca_trigger_price)
-            or
-            (not is_long and current_price >= dca_trigger_price)
-        )
-
-        if not should_dca:
-            return
-
-        side = tr['side']
-
-        amount_raw = (capital * LEVERAGE) / current_price
+async def place_dca_limit_order(sym, side, capital, price, label):
+    try:
+        amount_raw = (capital * LEVERAGE) / price
         amount = round_amount(sym, amount_raw)
-
         if amount <= 0:
-            return
-
-        order = await exchange.create_market_order(
-            sym,
-            side,
-            amount
+            return None
+        return await exchange.create_order(sym, 'limit', side, amount, price)
+    except ccxt.InsufficientFunds:
+        await send_telegram(
+            f"⚠️ *{label} LIMIT ORDER NOT PLACED (Insufficient Funds)*\n"
+            f"Symbol: {sym}\nPrice: {price:.6f}\nRequired Margin: ${capital}"
         )
+        logging.warning(f"Insufficient funds placing {label} for {sym}")
+        return None
+    except Exception as e:
+        logging.error(f"Place {label} order failed {sym}: {e}")
+        return None
 
-        filled_price = round_price(
-            sym,
-            order.get('average') or current_price
+async def place_tp_order(sym, side, amount, price):
+    try:
+        amount = round_amount(sym, amount)
+        if amount <= 0:
+            return None
+        return await exchange.create_order(sym, 'limit', side, amount, price, {'reduceOnly': True})
+    except ccxt.InsufficientFunds:
+        await send_telegram(f"⚠️ *TP ORDER NOT PLACED (Insufficient Funds)*\nSymbol: {sym}\nPrice: {price:.6f}")
+        logging.warning(f"Insufficient funds placing TP for {sym}")
+        return None
+    except Exception as e:
+        logging.error(f"Place TP order failed {sym}: {e}")
+        return None
+
+async def handle_dca_filled(sym, tr, order, stage):
+    try:
+        filled_price = round_price(sym, order.get('average') or order.get('price'))
+        filled_amount = order.get('filled') or order.get('amount')
+        scheme = tr.get('dca_scheme', 'sideways')
+        capital = (
+            BULLISH_DCA1_CAPITAL if scheme == 'bullish_long'
+            else (SIDEWAYS_DCA1_CAPITAL if stage == 1 else SIDEWAYS_DCA2_CAPITAL)
         )
 
         tr['entries'].append({
             'price': filled_price,
-            'amount': amount,
+            'amount': filled_amount,
             'margin': capital,
             'ts': time.time(),
-            'stage': dca_stage
+            'stage': stage
         })
 
-        avg_entry, _ = get_avg_entry_and_total(tr)
-
+        avg_entry, total_amount = get_avg_entry_and_total(tr)
         tr['avg_entry'] = avg_entry
-        tr['dca_stage'] = dca_stage
+        tr['dca_stage'] = max(tr['dca_stage'], stage)
+        tr[f'dca{stage}_order_id'] = None  # this leg is filled, nothing left to track
 
-        tp_pct = (
-            TP_AFTER_DCA1_PCT
-            if dca_stage == 1
-            else TP_AFTER_DCA2_PCT
-        )
+        is_long = tr['side'] == 'buy'
+        if scheme == 'bullish_long':
+            tp_pct = BULLISH_TP_AFTER_DCA1_PCT
+        else:
+            tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if len(tr['entries']) == 2 else SIDEWAYS_TP_AFTER_DCA2_PCT
 
-        tr['tp'] = round_price(
-            sym,
-            avg_entry * (1 + tp_pct)
-            if is_long
-            else avg_entry * (1 - tp_pct)
-        )
+        new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
+        tr['tp'] = new_tp
+
+        # replace the resting TP order to cover the new average / full size
+        await cancel_order_safe(sym, tr.get('tp_order_id'))
+        opposite_side = 'sell' if is_long else 'buy'
+        new_tp_order = await place_tp_order(sym, opposite_side, total_amount, new_tp)
+        tr['tp_order_id'] = new_tp_order['id'] if new_tp_order else None
 
         save_trades()
-
-        logging.info(
-            f"DCA{dca_stage} executed on {sym} @ {filled_price}"
-        )
+        logging.info(f"DCA{stage} filled on {sym} @ {filled_price} | new avg {avg_entry} | new TP {new_tp}")
 
         msg_text = build_trade_message(tr, sym)
-
         if tr.get('msg_id_initial'):
-            await edit_telegram_message(
-                tr['msg_id_initial'],
-                msg_text
-            )
-
-    except ccxt.InsufficientFunds:
-
-        warning_key = f"dca{dca_stage}_warning_sent"
-
-        if not tr.get(warning_key, False):
-
-            tr[warning_key] = True
-            save_trades()
-
-            await send_telegram(
-                f"⚠️ *INSUFFICIENT FUNDS*\n\n"
-                f"Symbol: {sym}\n"
-                f"Stage: DCA{dca_stage}\n"
-                f"Required Margin: ${capital}\n"
-                f"Current Price: {current_price:.6f}\n"
-                f"Trade remains active."
-            )
-
-            logging.warning(
-                f"Insufficient funds for DCA{dca_stage} on {sym}"
-            )
-
-        return
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
 
     except Exception as e:
-        logging.error(
-            f"DCA failed on {sym}: {e}"
-        )
+        logging.error(f"DCA{stage} fill handling failed {sym}: {e}")
+
+async def handle_tp_filled(sym, tr, order):
+    try:
+        exit_price = round_price(sym, order.get('average') or order.get('price'))
+        side = tr['side']
+        avg_entry = tr['avg_entry']
+        pnl_pct = (exit_price - avg_entry) / avg_entry * 100 if side == 'buy' else (avg_entry - exit_price) / avg_entry * 100
+        total_margin = sum(e['margin'] for e in tr['entries'])
+        pnl_usdt = total_margin * (pnl_pct / 100) * LEVERAGE
+
+        # cancel any still-resting DCA orders so they don't open a stray position later
+        await cancel_order_safe(sym, tr.get('dca1_order_id'))
+        await cancel_order_safe(sym, tr.get('dca2_order_id'))
+
+        closed = {**tr, 'exit_price': exit_price, 'exit_ts': time.time(), 'hit_type': 'TP',
+                  'pnl_pct': pnl_pct, 'pnl_usdt': pnl_usdt, 'closed_at': get_ist_time().isoformat()}
+        save_closed_trade(closed)
+
+        msg_text = build_trade_message(tr, sym, is_final=True, hit_type='TP', exit_price=exit_price, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+
+        del open_trades[sym]
+        save_trades()
+        logging.info(f"TP filled on {sym} @ {exit_price}")
+
+    except Exception as e:
+        logging.error(f"TP fill handling failed {sym}: {e}")
+
+async def check_trade_orders(sym):
+    """Poll a single trade's resting TP/DCA1/DCA2 orders for fills."""
+    async with trade_lock:
+        tr = open_trades.get(sym)
+        if not tr:
+            return
+
+        tp_id = tr.get('tp_order_id')
+        if tp_id:
+            order = await safe_fetch_order(sym, tp_id)
+            if order and order.get('status') == 'closed':
+                await handle_tp_filled(sym, tr, order)
+                return  # trade is closed, nothing else to check
+
+        dca1_id = tr.get('dca1_order_id')
+        if dca1_id:
+            order = await safe_fetch_order(sym, dca1_id)
+            if order and order.get('status') == 'closed':
+                await handle_dca_filled(sym, tr, order, stage=1)
+
+        dca2_id = tr.get('dca2_order_id')
+        if dca2_id:
+            order = await safe_fetch_order(sym, dca2_id)
+            if order and order.get('status') == 'closed':
+                await handle_dca_filled(sym, tr, order, stage=2)
+
+async def order_monitor_loop():
+    """Watches resting DCA1/DCA2/TP limit orders and reacts to fills."""
+    while True:
+        try:
+            syms = list(open_trades.keys())
+            for sym in syms:
+                await check_trade_orders(sym)
+            await asyncio.sleep(ORDER_CHECK_INTERVAL)
+        except Exception as e:
+            logging.error(f"Order monitor loop error: {e}")
+            await asyncio.sleep(ORDER_CHECK_INTERVAL)
+
 async def close_trade(sym, hit_type, exit_price):
     try:
         tr = open_trades[sym]
         side = tr['side']
         close_side = 'sell' if side == 'buy' else 'buy'
         total_amount = sum(e['amount'] for e in tr['entries'])
+
+        # cancel any resting TP/DCA orders first so nothing is left orphaned
+        await cancel_order_safe(sym, tr.get('tp_order_id'))
+        await cancel_order_safe(sym, tr.get('dca1_order_id'))
+        await cancel_order_safe(sym, tr.get('dca2_order_id'))
 
         close_order = await exchange.create_market_order(sym, close_side, total_amount)
         filled_exit = round_price(sym, close_order.get('average') or exit_price)
@@ -820,6 +920,11 @@ async def eth_filter_loop():
 
 # === PROCESS SYMBOL WITH INSUFFICIENT HANDLING ===
 async def process_symbol(symbol, timeframe):
+    side = None
+    is_reversal = False
+    pattern = None
+    big_open = None
+    entry_price = None
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
         if len(candles) < 9: return
@@ -830,7 +935,7 @@ async def process_symbol(symbol, timeframe):
         async with trade_lock:
             if len(open_trades) >= MAX_OPEN_TRADES: return
             if sent_signals.get(key) == signal_time: return
- 
+
             sent_signals[key] = signal_time
 
         is_rising, big_candle = detect_rising_three(candles)
@@ -879,8 +984,9 @@ async def process_symbol(symbol, timeframe):
             return
 
         await prepare_symbol(symbol)
-        ticker = await exchange.fetch_ticker(symbol)
-        entry_price = round_price(symbol, ticker['last'])
+        # Reuse the just-closed signal candle's close instead of an extra fetch_ticker
+        # round-trip - cuts latency between signal detection and order placement.
+        entry_price = round_price(symbol, candles[-2][4])
 
         amount_raw = (CAPITAL_INITIAL * LEVERAGE) / entry_price
         amount = round_amount(symbol, amount_raw)
@@ -889,20 +995,21 @@ async def process_symbol(symbol, timeframe):
         entry_order = await exchange.create_market_order(symbol, side, amount)
         filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
-        if eth_trend == "BULLISH":
-            tp_pct = 1.0 / 100
-        elif eth_trend == "SIDEWAYS":
-            tp_pct = 0.75 / 100
-        else:
-            tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
-        tp = round_price(symbol, filled_price * (1 + tp_pct) if side == 'buy' else filled_price * (1 - tp_pct))
+        dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
+            symbol, eth_trend, side, is_reversal, big_open, filled_price
+        )
 
-        if is_reversal:
-            dca1_level = filled_price * (1 + 0.01) if side == 'sell' else filled_price * (1 - 0.01)
-            dca2_level = dca1_level * (1 + DCA2_TRIGGER_PCT) if side == 'sell' else dca1_level * (1 - DCA2_TRIGGER_PCT)
-        else:
-            dca1_level = big_open
-            dca2_level = big_open * (1 - DCA2_TRIGGER_PCT) if side == 'buy' else big_open * (1 + DCA2_TRIGGER_PCT)
+        # Place DCA1 (and DCA2, if this scheme has one) as resting limit orders
+        dca1_capital = BULLISH_DCA1_CAPITAL if dca_scheme == 'bullish_long' else SIDEWAYS_DCA1_CAPITAL
+        dca1_order = await place_dca_limit_order(symbol, side, dca1_capital, dca1_level, 'DCA1')
+
+        dca2_order = None
+        if dca2_level is not None:
+            dca2_order = await place_dca_limit_order(symbol, side, SIDEWAYS_DCA2_CAPITAL, dca2_level, 'DCA2')
+
+        opposite_side = 'sell' if side == 'buy' else 'buy'
+        tp_order = await place_tp_order(symbol, opposite_side, amount, tp)
+
         initial_trade = {
             'side': side,
             'initial_price': filled_price,
@@ -917,17 +1024,19 @@ async def process_symbol(symbol, timeframe):
             'tp': tp,
             'dca_stage': 0,
 
-            'dca1_warning_sent': False,
-            'dca2_warning_sent': False,
-
             'msg_id_initial': None,
             'open_ts': time.time(),
             'timeframe': timeframe,
             'signal_reason': signal_msg,
             'pattern': pattern,
             'is_reversal': is_reversal,
-            'dca1_level': round_price(symbol, dca1_level),
-            'dca2_level': round_price(symbol, dca2_level)
+            'dca_scheme': dca_scheme,
+            'sl_reference_price': sl_reference_price,
+            'dca1_level': dca1_level,
+            'dca2_level': dca2_level,  # None for bullish_long scheme
+            'tp_order_id': tp_order['id'] if tp_order else None,
+            'dca1_order_id': dca1_order['id'] if dca1_order else None,
+            'dca2_order_id': dca2_order['id'] if dca2_order else None,
         }
 
         msg_text = build_trade_message(initial_trade, symbol)
@@ -938,39 +1047,14 @@ async def process_symbol(symbol, timeframe):
             open_trades[symbol] = initial_trade
             await asyncio.to_thread(save_trades)
 
-        logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'}")
+        logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'} | scheme={dca_scheme}")
 
     except ccxt.InsufficientFunds:
 
-        tp_pct = TP_INITIAL_REVERSAL_PCT if is_reversal else TP_INITIAL_NORMAL_PCT
-
-        tp = round_price(
-            symbol,
-            entry_price * (1 + tp_pct)
-            if side == "buy"
-            else entry_price * (1 - tp_pct)
+        dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
+            symbol, eth_trend, side, is_reversal, big_open, entry_price
         )
-
-        if is_reversal:
-            dca1_level = (
-                entry_price * (1 + 0.01)
-                if side == "sell"
-                else entry_price * (1 - 0.01)
-            )
-
-            dca2_level = (
-                dca1_level * (1 + DCA2_TRIGGER_PCT)
-                if side == "sell"
-                else dca1_level * (1 - DCA2_TRIGGER_PCT)
-            )
-        else:
-            dca1_level = big_open
-
-            dca2_level = (
-                big_open * (1 - DCA2_TRIGGER_PCT)
-                if side == "buy"
-                else big_open * (1 + DCA2_TRIGGER_PCT)
-            )
+        dca2_str = f"{dca2_level:.6f}" if dca2_level is not None else "N/A (no DCA2)"
 
         await send_telegram(
             f"⚠️ *INSUFFICIENT FUNDS*\n\n"
@@ -980,7 +1064,7 @@ async def process_symbol(symbol, timeframe):
             f"Entry: {entry_price:.6f}\n"
             f"TP: {tp:.6f}\n"
             f"DCA1: {dca1_level:.6f}\n"
-            f"DCA2: {dca2_level:.6f}\n\n"
+            f"DCA2: {dca2_str}\n\n"
             f"Required Margin: ${CAPITAL_INITIAL}"
         )
 
@@ -1048,12 +1132,13 @@ async def main():
 
     logging.info(f"Starting bot with {len(symbols)} symbols")
 
-    startup_msg = f"🚀 **Bot Restarted** @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\nPatterns + Wick Filter | SL: 8% | Insufficient Warning Active"
+    startup_msg = f"🚀 **Bot Restarted** @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\nPatterns + Wick Filter | SL: trend-based | Insufficient Warning Active"
     await send_telegram(startup_msg)
 
     tasks = [
     asyncio.create_task(scan_loop(symbols)),
-    asyncio.create_task(monitor_tp_and_dca()),
+    asyncio.create_task(sl_monitor_loop()),
+    asyncio.create_task(order_monitor_loop()),
     asyncio.create_task(daily_summary()),
     asyncio.create_task(eth_filter_loop()),
 ]

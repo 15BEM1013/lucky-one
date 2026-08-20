@@ -45,6 +45,10 @@ SIDEWAYS_TP_AFTER_DCA2_PCT = 0.6 / 100
 SIDEWAYS_SL_PCT = 5.0 / 100            # fixed, off entry price
 SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 
+# --- Volatility flag thresholds ---
+CANDLE_FLAG_PCT = 2.0     # big-candle body % change threshold
+DAY_DANGER_PCT = 10.0     # 24h % change threshold for the "danger" tier
+
 TP_CHECK_INTERVAL = 0.5      # SL price-poll interval
 ORDER_CHECK_INTERVAL = 2.0   # DCA1/DCA2/TP resting-limit-order fill-check interval
 MAX_OPEN_TRADES = 5
@@ -461,42 +465,118 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 
     return dca_scheme, tp, dca1_level, dca2_level, sl_reference_price
 
+# === PROJECTED TP (before DCA legs actually fill) ===
+def compute_projected_tps(sym, tr):
+    """
+    Pre-compute what TP will become after DCA1 / DCA2 fill, using their
+    known resting limit-order prices (dca1_level / dca2_level) — this is a
+    projection based on where those orders sit, not a guarantee of the
+    actual fill price. Once a DCA leg really fills, tr['tp'] (updated live
+    in handle_dca_filled) is the authoritative value.
+
+    Returns a dict with keys: 'initial', and optionally 'after_dca1',
+    'after_dca2' depending on the scheme / whether those levels exist.
+    """
+    is_long = tr['side'] == 'buy'
+    scheme = tr.get('dca_scheme', 'sideways')
+    initial_price = tr['entries'][0]['price']
+    initial_amount = tr['entries'][0]['amount']
+
+    result = {'initial': tr['tp']}
+
+    dca1_level = tr.get('dca1_level')
+    if not dca1_level:
+        return result
+
+    dca1_capital = BULLISH_DCA1_CAPITAL if scheme == 'bullish_long' else SIDEWAYS_DCA1_CAPITAL
+    dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
+    total_amt1 = initial_amount + dca1_amount
+    if total_amt1 <= 0:
+        return result
+    avg1 = (initial_price * initial_amount + dca1_level * dca1_amount) / total_amt1
+
+    tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT if scheme == 'bullish_long' else SIDEWAYS_TP_AFTER_DCA1_PCT
+    tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
+    result['after_dca1'] = round_price(sym, tp1)
+
+    dca2_level = tr.get('dca2_level')
+    if dca2_level and scheme != 'bullish_long':
+        dca2_amount = round_amount(sym, (SIDEWAYS_DCA2_CAPITAL * LEVERAGE) / dca2_level)
+        total_amt2 = total_amt1 + dca2_amount
+        if total_amt2 > 0:
+            avg2 = (initial_price * initial_amount + dca1_level * dca1_amount + dca2_level * dca2_amount) / total_amt2
+            tp2 = avg2 * (1 + SIDEWAYS_TP_AFTER_DCA2_PCT) if is_long else avg2 * (1 - SIDEWAYS_TP_AFTER_DCA2_PCT)
+            result['after_dca2'] = round_price(sym, tp2)
+
+    return result
+
 # === BUILD TRADE MESSAGE ===
 def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
     is_long = tr['side'] == 'buy'
     duration = format_duration(time.time() - tr['open_ts'])
     avg = tr['avg_entry']
     scheme = tr.get('dca_scheme', 'sideways')
+    divider = "━━━━━━━━━━━━━━━"
 
-    lines = [
-        f"**{'LONG' if is_long else 'SHORT'}** {sym} ({tr.get('timeframe', 'N/A')})",
-        f"Entry: {tr['initial_price']:.6f} | Avg: {avg:.6f}",
-        f"Duration: {duration}"
-    ]
+    # --- Final hit message (TP or SL) ---
+    if is_final and hit_type:
+        icon = "✅" if hit_type == "TP" else "❌"
+        pnl_icon = "🟢" if (pnl_usdt or 0) >= 0 else "🔴"
+        return (
+            f"{divider}\n"
+            f"{icon} {hit_type} HIT — {'LONG' if is_long else 'SHORT'} {sym}\n"
+            f"{divider}\n"
+            f"📥 Entry: {tr['initial_price']:.6f} → Avg: {avg:.6f}\n"
+            f"📤 Exit: `{exit_price:.6f}`\n"
+            f"⏱ Duration: {duration}\n\n"
+            f"💵 PnL: {pnl_pct:+.2f}% (${pnl_usdt:+.2f}) {pnl_icon}"
+        )
 
-    entries_str = [f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']})" for e in tr['entries']]
+    # --- Live / open trade message ---
+    lines = [divider]
+    if tr.get('is_danger'):
+        lines.append("⚡ HIGH VOLATILITY")
+    elif tr.get('is_caution'):
+        lines.append("🔸 SHARP MOVE")
+
+    side_icon = "🟢 LONG" if is_long else "🔴 SHORT"
+    lines.append(f"{side_icon} {sym}")
+    lines.append(divider)
+
+    total_margin = sum(e['margin'] for e in tr['entries'])
+    lines.append(f"📥 Entry: `{tr['initial_price']:.6f}`  ⏱ {tr.get('timeframe', 'N/A')}")
+    lines.append(f"💰 Margin: ${total_margin:g}")
+    lines.append("")
+
+    entries_str = [f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']:g})" for e in tr['entries']]
     lines.append("Entries: " + " | ".join(entries_str))
+    if len(tr['entries']) > 1:
+        lines.append(f"Avg: `{avg:.6f}`")
+    lines.append("")
+
+    projected = compute_projected_tps(sym, tr)
+    tp_chain = f"{tr['initial_price']:.6f} → {projected['initial']:.6f}"
+    if 'after_dca1' in projected:
+        tp_chain += f" → {projected['after_dca1']:.6f} (DCA1)"
+    if 'after_dca2' in projected:
+        tp_chain += f" → {projected['after_dca2']:.6f} (DCA2)"
+    lines.append("🎯 TP Path")
+    lines.append(tp_chain)
+    lines.append("")
 
     sl_pct = BULLISH_SL_PCT if scheme == 'bullish_long' else SIDEWAYS_SL_PCT
     sl_ref = tr.get('sl_reference_price', avg)
     sl_price = round_price(sym, sl_ref * (1 - sl_pct) if is_long else sl_ref * (1 + sl_pct))
-    lines.append(f"TP: {tr['tp']:.6f} | SL: {sl_price:.6f} ({sl_pct*100:.1f}%)")
+    sl_sign = "-" if is_long else "+"
+    lines.append(f"🛡 SL: `{sl_price:.6f}` ({sl_sign}{sl_pct*100:.1f}%)")
+    lines.append("")
 
-    if scheme == 'bullish_long':
-        lines.append(f"DCA1 Level: {tr['dca1_level']:.6f} (0.2% above big-candle open) | No DCA2")
-    else:
-        lines.append(f"DCA1 Level: {tr['dca1_level']:.6f} (1% from entry)")
-        lines.append(f"DCA2 Level: {tr['dca2_level']:.6f} (3% from entry)")
-
-    if tr.get('signal_reason'):
-        lines.append(f"Signal: {tr['signal_reason']}")
+    lines.append(f"📊 Δ Candle: {tr.get('candle_change_pct', 0):.2f}%  |  Δ 24h: {tr.get('day_change_pct', 0):+.2f}%")
 
     pattern_type = "Strong Rejection" if tr.get('is_reversal') else "Continuation"
-    lines.append(f"{tr.get('pattern', 'Pattern')} - {pattern_type}")
-
-    if is_final and hit_type:
-        lines.append(f"**{hit_type} HIT** | Exit: {exit_price:.6f}")
-        lines.append(f"PnL: {pnl_pct:.2f}% (${pnl_usdt:+.2f})")
+    lines.append(f"🔍 {tr.get('pattern', 'Pattern')} ({pattern_type})")
+    if tr.get('signal_reason'):
+        lines.append(tr['signal_reason'])
 
     return "\n".join(lines)
 
@@ -925,6 +1005,10 @@ async def process_symbol(symbol, timeframe):
     pattern = None
     big_open = None
     entry_price = None
+    candle_change_pct = 0.0
+    day_change_pct = 0.0
+    is_danger = False
+    is_caution = False
     try:
         candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
         if len(candles) < 9: return
@@ -945,10 +1029,12 @@ async def process_symbol(symbol, timeframe):
             pattern = 'Rising Three'
             side, signal_msg, is_reversal = get_wick_signal(big_candle)
             big_open = big_candle[1]
+            candle_change_pct = body_pct(big_candle)
         elif is_falling:
             pattern = 'Falling Three'
             side, signal_msg, is_reversal = get_wick_signal(big_candle_f)
             big_open = big_candle_f[1]
+            candle_change_pct = body_pct(big_candle_f)
         else:
             return
 
@@ -984,6 +1070,18 @@ async def process_symbol(symbol, timeframe):
             return
 
         await prepare_symbol(symbol)
+
+        # 24h % change for this symbol (used for the danger/caution flag)
+        try:
+            ticker = await exchange.fetch_ticker(symbol)
+            day_change_pct = ticker.get('percentage') or 0.0
+        except Exception as e:
+            logging.warning(f"fetch_ticker failed for {symbol}: {e}")
+            day_change_pct = 0.0
+
+        is_danger = abs(candle_change_pct) > CANDLE_FLAG_PCT and abs(day_change_pct) > DAY_DANGER_PCT
+        is_caution = abs(candle_change_pct) > CANDLE_FLAG_PCT and not is_danger
+
         # Reuse the just-closed signal candle's close instead of an extra fetch_ticker
         # round-trip - cuts latency between signal detection and order placement.
         entry_price = round_price(symbol, candles[-2][4])
@@ -1037,6 +1135,10 @@ async def process_symbol(symbol, timeframe):
             'tp_order_id': tp_order['id'] if tp_order else None,
             'dca1_order_id': dca1_order['id'] if dca1_order else None,
             'dca2_order_id': dca2_order['id'] if dca2_order else None,
+            'candle_change_pct': candle_change_pct,
+            'day_change_pct': day_change_pct,
+            'is_danger': is_danger,
+            'is_caution': is_caution,
         }
 
         msg_text = build_trade_message(initial_trade, symbol)
@@ -1056,7 +1158,14 @@ async def process_symbol(symbol, timeframe):
         )
         dca2_str = f"{dca2_level:.6f}" if dca2_level is not None else "N/A (no DCA2)"
 
+        flag = ""
+        if is_danger:
+            flag = "⚡ HIGH VOLATILITY\n"
+        elif is_caution:
+            flag = "🔸 SHARP MOVE\n"
+
         await send_telegram(
+            f"{flag}"
             f"⚠️ *INSUFFICIENT FUNDS*\n\n"
             f"Symbol: {symbol}\n"
             f"Side: {side.upper()}\n"
@@ -1065,6 +1174,7 @@ async def process_symbol(symbol, timeframe):
             f"TP: {tp:.6f}\n"
             f"DCA1: {dca1_level:.6f}\n"
             f"DCA2: {dca2_str}\n\n"
+            f"Δ Candle: {candle_change_pct:.2f}% | Δ 24h: {day_change_pct:+.2f}%\n"
             f"Required Margin: ${CAPITAL_INITIAL}"
         )
 

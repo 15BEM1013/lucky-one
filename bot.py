@@ -468,45 +468,68 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 # === PROJECTED TP (before DCA legs actually fill) ===
 def compute_projected_tps(sym, tr):
     """
-    Pre-compute what TP will become after DCA1 / DCA2 fill, using their
-    known resting limit-order prices (dca1_level / dca2_level) — this is a
-    projection based on where those orders sit, not a guarantee of the
-    actual fill price. Once a DCA leg really fills, tr['tp'] (updated live
-    in handle_dca_filled) is the authoritative value.
+    Build the full TP chain: the original (immutable) initial TP, plus the
+    TP-after-DCA1 / TP-after-DCA2 levels — using REAL fill price/amount for
+    any DCA leg that has already filled, and a PROJECTION off the resting
+    dca1_level/dca2_level for any leg that hasn't filled yet. This works
+    identically for LONG and SHORT trades since it operates purely on
+    weighted averages and the is_long flag controls TP direction.
 
-    Returns a dict with keys: 'initial', and optionally 'after_dca1',
-    'after_dca2' depending on the scheme / whether those levels exist.
+    Returns a dict:
+      'initial'      -> original TP set at trade open (never mutated)
+      'after_dca1'   -> present if dca1_level exists
+      'dca1_filled'  -> True if DCA1 has actually filled
+      'after_dca2'   -> present if dca2_level exists (sideways scheme only)
+      'dca2_filled'  -> True if DCA2 has actually filled
     """
     is_long = tr['side'] == 'buy'
     scheme = tr.get('dca_scheme', 'sideways')
-    initial_price = tr['entries'][0]['price']
-    initial_amount = tr['entries'][0]['amount']
+    dca_stage = tr.get('dca_stage', 0)
 
-    result = {'initial': tr['tp']}
+    # Original TP, fixed at trade creation — never touched by handle_dca_filled
+    result = {'initial': tr.get('tp_initial', tr['tp'])}
 
     dca1_level = tr.get('dca1_level')
     if not dca1_level:
         return result
 
-    dca1_capital = BULLISH_DCA1_CAPITAL if scheme == 'bullish_long' else SIDEWAYS_DCA1_CAPITAL
-    dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
-    total_amt1 = initial_amount + dca1_amount
-    if total_amt1 <= 0:
-        return result
-    avg1 = (initial_price * initial_amount + dca1_level * dca1_amount) / total_amt1
+    # --- Stage 1: DCA1 filled or projected ---
+    if dca_stage >= 1:
+        stage1_entries = [e for e in tr['entries'] if e['stage'] <= 1]
+        cum_amount = sum(e['amount'] for e in stage1_entries)
+        cum_weighted = sum(e['price'] * e['amount'] for e in stage1_entries)
+    else:
+        initial_price = tr['entries'][0]['price']
+        initial_amount = tr['entries'][0]['amount']
+        dca1_capital = BULLISH_DCA1_CAPITAL if scheme == 'bullish_long' else SIDEWAYS_DCA1_CAPITAL
+        dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
+        cum_amount = initial_amount + dca1_amount
+        cum_weighted = initial_price * initial_amount + dca1_level * dca1_amount
 
-    tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT if scheme == 'bullish_long' else SIDEWAYS_TP_AFTER_DCA1_PCT
-    tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
-    result['after_dca1'] = round_price(sym, tp1)
+    if cum_amount > 0:
+        avg1 = cum_weighted / cum_amount
+        tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT if scheme == 'bullish_long' else SIDEWAYS_TP_AFTER_DCA1_PCT
+        tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
+        result['after_dca1'] = round_price(sym, tp1)
+        result['dca1_filled'] = dca_stage >= 1
 
+    # --- Stage 2: DCA2 filled or projected (sideways scheme only) ---
     dca2_level = tr.get('dca2_level')
     if dca2_level and scheme != 'bullish_long':
-        dca2_amount = round_amount(sym, (SIDEWAYS_DCA2_CAPITAL * LEVERAGE) / dca2_level)
-        total_amt2 = total_amt1 + dca2_amount
-        if total_amt2 > 0:
-            avg2 = (initial_price * initial_amount + dca1_level * dca1_amount + dca2_level * dca2_amount) / total_amt2
+        if dca_stage >= 2:
+            stage2_entries = [e for e in tr['entries'] if e['stage'] <= 2]
+            cum_amount2 = sum(e['amount'] for e in stage2_entries)
+            cum_weighted2 = sum(e['price'] * e['amount'] for e in stage2_entries)
+        else:
+            dca2_amount = round_amount(sym, (SIDEWAYS_DCA2_CAPITAL * LEVERAGE) / dca2_level)
+            cum_amount2 = cum_amount + dca2_amount
+            cum_weighted2 = cum_weighted + dca2_level * dca2_amount
+
+        if cum_amount2 > 0:
+            avg2 = cum_weighted2 / cum_amount2
             tp2 = avg2 * (1 + SIDEWAYS_TP_AFTER_DCA2_PCT) if is_long else avg2 * (1 - SIDEWAYS_TP_AFTER_DCA2_PCT)
             result['after_dca2'] = round_price(sym, tp2)
+            result['dca2_filled'] = dca_stage >= 2
 
     return result
 
@@ -557,9 +580,11 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
     projected = compute_projected_tps(sym, tr)
     tp_chain = f"{tr['initial_price']:.6f} → {projected['initial']:.6f}"
     if 'after_dca1' in projected:
-        tp_chain += f" → {projected['after_dca1']:.6f} (DCA1)"
+        tag = "DCA1 ✓" if projected.get('dca1_filled') else "DCA1"
+        tp_chain += f" → {projected['after_dca1']:.6f} ({tag})"
     if 'after_dca2' in projected:
-        tp_chain += f" → {projected['after_dca2']:.6f} (DCA2)"
+        tag = "DCA2 ✓" if projected.get('dca2_filled') else "DCA2"
+        tp_chain += f" → {projected['after_dca2']:.6f} ({tag})"
     lines.append("🎯 TP Path")
     lines.append(tp_chain)
     lines.append("")
@@ -1120,6 +1145,7 @@ async def process_symbol(symbol, timeframe):
             }],
             'avg_entry': filled_price,
             'tp': tp,
+            'tp_initial': tp,  # immutable snapshot of the original TP — never overwritten
             'dca_stage': 0,
 
             'msg_id_initial': None,

@@ -1182,6 +1182,29 @@ async def process_symbol(symbol, timeframe):
         dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
             symbol, eth_trend, side, is_reversal, big_open, entry_price
         )
+
+        # Build a minimal trade-shaped dict (no entries actually filled) so we
+        # can reuse compute_projected_tps for the "TP after DCA1/DCA2" chain,
+        # same as a live trade message shows.
+        planned_amount = locals().get('amount') or round_amount(symbol, (CAPITAL_INITIAL * LEVERAGE) / entry_price)
+        temp_tr = {
+            'side': side,
+            'entries': [{'price': entry_price, 'amount': planned_amount, 'stage': 0}],
+            'tp': tp,
+            'tp_initial': tp,
+            'dca_stage': 0,
+            'dca_scheme': dca_scheme,
+            'dca1_level': dca1_level,
+            'dca2_level': dca2_level,
+        }
+        projected = compute_projected_tps(symbol, temp_tr)
+
+        tp_chain = f"{entry_price:.6f} → {projected['initial']:.6f}"
+        if 'after_dca1' in projected:
+            tp_chain += f" → {projected['after_dca1']:.6f} (DCA1)"
+        if 'after_dca2' in projected:
+            tp_chain += f" → {projected['after_dca2']:.6f} (DCA2)"
+
         dca2_str = f"{dca2_level:.6f}" if dca2_level is not None else "N/A (no DCA2)"
 
         flag = ""
@@ -1197,9 +1220,10 @@ async def process_symbol(symbol, timeframe):
             f"Side: {side.upper()}\n"
             f"Pattern: {pattern}\n\n"
             f"Entry: {entry_price:.6f}\n"
-            f"TP: {tp:.6f}\n"
             f"DCA1: {dca1_level:.6f}\n"
             f"DCA2: {dca2_str}\n\n"
+            f"🎯 TP Path\n"
+            f"{tp_chain}\n\n"
             f"Δ Candle: {candle_change_pct:.2f}% | Δ 24h: {day_change_pct:+.2f}%\n"
             f"Required Margin: ${CAPITAL_INITIAL}"
         )

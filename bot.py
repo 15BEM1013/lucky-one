@@ -577,6 +577,18 @@ def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, ex
         lines.append(f"Avg: `{avg:.6f}`")
     lines.append("")
 
+    # Show resting DCA order prices that haven't filled yet (filled ones
+    # already appear in the "Entries" line above, so no need to repeat them).
+    dca_stage = tr.get('dca_stage', 0)
+    dca_order_lines = []
+    if tr.get('dca1_level') is not None and dca_stage < 1:
+        dca_order_lines.append(f"DCA1: `{tr['dca1_level']:.6f}`")
+    if tr.get('dca2_level') is not None and dca_stage < 2:
+        dca_order_lines.append(f"DCA2: `{tr['dca2_level']:.6f}`")
+    if dca_order_lines:
+        lines.append("🧩 DCA Orders: " + " | ".join(dca_order_lines))
+        lines.append("")
+
     projected = compute_projected_tps(sym, tr)
     tp_chain = f"{tr['initial_price']:.6f} → {projected['initial']:.6f}"
     if 'after_dca1' in projected:
@@ -1220,8 +1232,7 @@ async def process_symbol(symbol, timeframe):
             f"Side: {side.upper()}\n"
             f"Pattern: {pattern}\n\n"
             f"Entry: {entry_price:.6f}\n"
-            f"DCA1: {dca1_level:.6f}\n"
-            f"DCA2: {dca2_str}\n\n"
+            f"🧩 DCA Orders: DCA1: {dca1_level:.6f} | DCA2: {dca2_str}\n\n"
             f"🎯 TP Path\n"
             f"{tp_chain}\n\n"
             f"Δ Candle: {candle_change_pct:.2f}% | Δ 24h: {day_change_pct:+.2f}%\n"

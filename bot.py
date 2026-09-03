@@ -45,19 +45,32 @@ SIDEWAYS_TP_AFTER_DCA2_PCT = 0.6 / 100
 SIDEWAYS_SL_PCT = 5.0 / 100            # fixed, off entry price
 SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 
-# --- "Double Sure Bet" SHORT scheme ---
+# --- "Double Sure Bet" scheme ---
 # Triggered when the big candle's upper AND lower wick are both >10% of its
-# body, OR the big candle's body is itself >3% (a huge-range candle). Either
-# condition forces a SHORT regardless of what the pattern/wick signal said.
+# body, OR the big candle's body is itself >3% (a huge-range candle).
+# Side depends on candle color: RED candle → BUY, GREEN candle → SELL
 DOUBLE_SURE_WICK_PCT = 10.0            # both wicks must exceed this % of body
 DOUBLE_SURE_BIG_CANDLE_PCT = 3.0       # OR: big-candle body % this large
 DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin
-DOUBLE_SURE_DCA1_TRIGGER_PCT = 1.5 / 100  # from entry price
-DOUBLE_SURE_DCA1_CAPITAL = 20.0
-DOUBLE_SURE_DCA2_TRIGGER_PCT = 3.0 / 100  # from entry price
-DOUBLE_SURE_DCA2_CAPITAL = 10.0
 DOUBLE_SURE_SL_PCT = 8.0 / 100          # fixed, off entry price
-DOUBLE_SURE_TP_PCT = 1.0 / 100          # applied off avg entry, before/after DCA
+
+# --- GREEN Candle (SELL) - Decreasing TP as positions add ---
+DOUBLE_SURE_GREEN_TP_INITIAL = 1.0 / 100
+DOUBLE_SURE_GREEN_TP_AFTER_DCA1 = 0.8 / 100
+DOUBLE_SURE_GREEN_TP_AFTER_DCA2 = 0.6 / 100
+DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT = 1.5 / 100
+DOUBLE_SURE_GREEN_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
+DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
+
+# --- RED Candle (BUY) - Different structure ---
+DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
+DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 0.5 / 100
+DOUBLE_SURE_RED_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_RED_TP_AFTER_DCA1 = 2.0 / 100
+DOUBLE_SURE_RED_DCA2_TRIGGER_PCT = 3.0 / 100
+DOUBLE_SURE_RED_DCA2_CAPITAL = 10.0
+DOUBLE_SURE_RED_TP_AFTER_DCA2 = 1.5 / 100
 
 # --- Volatility flag thresholds ---
 CANDLE_FLAG_PCT = 2.0     # big-candle body % change threshold
@@ -439,7 +452,7 @@ def get_avg_entry_and_total(tr):
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
 # === TREND-BASED TRADE PLAN ===
-def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False):
+def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False):
     """
     Decides which DCA/TP/SL scheme a trade uses, and computes the initial
     levels for it.
@@ -448,12 +461,11 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
     price (InsufficientFunds fallback, order never filled).
 
     Three schemes:
-      - 'double_sure': the double-wick / big-candle override SHORT. Always
-        takes priority when is_double_sure is True.
+      - 'double_sure': the double-wick / big-candle override SHORT/BUY.
+        Color-dependent TP structure.
       - 'bullish_long': ETH-bullish trend, continuation LONG (Rising Three,
         non-reversal, buy side) only.
-      - 'sideways': everything else that reaches this point — actual
-        ETH-sideways SHORTs, and ETH-bullish reversal SHORTs.
+      - 'sideways': everything else that reaches this point.
 
     Returns: (dca_scheme, tp, dca1_level, dca2_level_or_None, sl_reference_price)
     All price values are rounded to the symbol's tick size.
@@ -463,9 +475,16 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 
     if is_double_sure:
         dca_scheme = 'double_sure'
-        tp_pct = DOUBLE_SURE_TP_PCT
-        dca1_level = ref_price * (1 + DOUBLE_SURE_DCA1_TRIGGER_PCT)  # always short
-        dca2_level = ref_price * (1 + DOUBLE_SURE_DCA2_TRIGGER_PCT)
+        
+        if is_double_sure_red:  # RED candle BUY
+            tp_pct = DOUBLE_SURE_RED_TP_INITIAL
+            dca1_level = ref_price * (1 - DOUBLE_SURE_RED_DCA1_TRIGGER_PCT)
+            dca2_level = ref_price * (1 - DOUBLE_SURE_RED_DCA2_TRIGGER_PCT)
+        else:  # GREEN candle SELL
+            tp_pct = DOUBLE_SURE_GREEN_TP_INITIAL
+            dca1_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT)
+            dca2_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT)
+        
         sl_reference_price = ref_price
     elif use_bullish_long_scheme:
         dca_scheme = 'bullish_long'
@@ -501,12 +520,13 @@ def compute_projected_tps(sym, tr):
       'initial'      -> original TP set at trade open (never mutated)
       'after_dca1'   -> present if dca1_level exists
       'dca1_filled'  -> True if DCA1 has actually filled
-      'after_dca2'   -> present if dca2_level exists (sideways scheme only)
+      'after_dca2'   -> present if dca2_level exists (sideways/double_sure schemes only)
       'dca2_filled'  -> True if DCA2 has actually filled
     """
     is_long = tr['side'] == 'buy'
     scheme = tr.get('dca_scheme', 'sideways')
     dca_stage = tr.get('dca_stage', 0)
+    is_double_sure_red = tr.get('is_double_sure_red', False)
 
     # Original TP, fixed at trade creation — never touched by handle_dca_filled
     result = {'initial': tr.get('tp_initial', tr['tp'])}
@@ -523,22 +543,28 @@ def compute_projected_tps(sym, tr):
     else:
         initial_price = tr['entries'][0]['price']
         initial_amount = tr['entries'][0]['amount']
-        dca1_capital = (
-            BULLISH_DCA1_CAPITAL if scheme == 'bullish_long'
-            else DOUBLE_SURE_DCA1_CAPITAL if scheme == 'double_sure'
-            else SIDEWAYS_DCA1_CAPITAL
-        )
+        
+        if scheme == 'double_sure':
+            dca1_capital = DOUBLE_SURE_RED_DCA1_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA1_CAPITAL
+        elif scheme == 'bullish_long':
+            dca1_capital = BULLISH_DCA1_CAPITAL
+        else:
+            dca1_capital = SIDEWAYS_DCA1_CAPITAL
+            
         dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
         cum_amount = initial_amount + dca1_amount
         cum_weighted = initial_price * initial_amount + dca1_level * dca1_amount
 
     if cum_amount > 0:
         avg1 = cum_weighted / cum_amount
-        tp_pct1 = (
-            BULLISH_TP_AFTER_DCA1_PCT if scheme == 'bullish_long'
-            else DOUBLE_SURE_TP_PCT if scheme == 'double_sure'
-            else SIDEWAYS_TP_AFTER_DCA1_PCT
-        )
+        
+        if scheme == 'double_sure':
+            tp_pct1 = DOUBLE_SURE_RED_TP_AFTER_DCA1 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA1
+        elif scheme == 'bullish_long':
+            tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT
+        else:
+            tp_pct1 = SIDEWAYS_TP_AFTER_DCA1_PCT
+            
         tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
         result['after_dca1'] = round_price(sym, tp1)
         result['dca1_filled'] = dca_stage >= 1
@@ -546,8 +572,12 @@ def compute_projected_tps(sym, tr):
     # --- Stage 2: DCA2 filled or projected (sideways / double_sure schemes only) ---
     dca2_level = tr.get('dca2_level')
     if dca2_level and scheme != 'bullish_long':
-        dca2_capital = DOUBLE_SURE_DCA2_CAPITAL if scheme == 'double_sure' else SIDEWAYS_DCA2_CAPITAL
-        tp_pct2 = DOUBLE_SURE_TP_PCT if scheme == 'double_sure' else SIDEWAYS_TP_AFTER_DCA2_PCT
+        if scheme == 'double_sure':
+            dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
+            tp_pct2 = DOUBLE_SURE_RED_TP_AFTER_DCA2 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
+        else:
+            dca2_capital = SIDEWAYS_DCA2_CAPITAL
+            tp_pct2 = SIDEWAYS_TP_AFTER_DCA2_PCT
 
         if dca_stage >= 2:
             stage2_entries = [e for e in tr['entries'] if e['stage'] <= 2]
@@ -759,10 +789,15 @@ async def handle_dca_filled(sym, tr, order, stage):
         filled_price = round_price(sym, order.get('average') or order.get('price'))
         filled_amount = order.get('filled') or order.get('amount')
         scheme = tr.get('dca_scheme', 'sideways')
+        is_double_sure_red = tr.get('is_double_sure_red', False)
+        
         if scheme == 'bullish_long':
             capital = BULLISH_DCA1_CAPITAL
         elif scheme == 'double_sure':
-            capital = DOUBLE_SURE_DCA1_CAPITAL if stage == 1 else DOUBLE_SURE_DCA2_CAPITAL
+            if is_double_sure_red:
+                capital = DOUBLE_SURE_RED_DCA1_CAPITAL if stage == 1 else DOUBLE_SURE_RED_DCA2_CAPITAL
+            else:
+                capital = DOUBLE_SURE_GREEN_DCA1_CAPITAL if stage == 1 else DOUBLE_SURE_GREEN_DCA2_CAPITAL
         else:
             capital = SIDEWAYS_DCA1_CAPITAL if stage == 1 else SIDEWAYS_DCA2_CAPITAL
 
@@ -780,12 +815,16 @@ async def handle_dca_filled(sym, tr, order, stage):
         tr[f'dca{stage}_order_id'] = None  # this leg is filled, nothing left to track
 
         is_long = tr['side'] == 'buy'
+        
         if scheme == 'bullish_long':
             tp_pct = BULLISH_TP_AFTER_DCA1_PCT
         elif scheme == 'double_sure':
-            tp_pct = DOUBLE_SURE_TP_PCT
+            if is_double_sure_red:
+                tp_pct = DOUBLE_SURE_RED_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_RED_TP_AFTER_DCA2
+            else:
+                tp_pct = DOUBLE_SURE_GREEN_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
         else:
-            tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if len(tr['entries']) == 2 else SIDEWAYS_TP_AFTER_DCA2_PCT
+            tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if stage == 1 else SIDEWAYS_TP_AFTER_DCA2_PCT
 
         new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
         tr['tp'] = new_tp
@@ -1103,6 +1142,7 @@ async def process_symbol(symbol, timeframe):
     is_danger = False
     is_caution = False
     is_double_sure = False
+    is_double_sure_red = False
     upper_w = 0.0
     lower_w = 0.0
     try:
@@ -1146,18 +1186,30 @@ async def process_symbol(symbol, timeframe):
         # ==========================
         # Either both wicks blow past DOUBLE_SURE_WICK_PCT of the body, or the
         # big candle's own body is bigger than DOUBLE_SURE_BIG_CANDLE_PCT —
-        # either way it's a forced SHORT with its own capital/DCA/TP/SL.
+        # side depends on candle color: RED → BUY, GREEN → SELL
         is_double_sure = (
             (upper_w > DOUBLE_SURE_WICK_PCT and lower_w > DOUBLE_SURE_WICK_PCT)
             or abs(candle_change_pct) > DOUBLE_SURE_BIG_CANDLE_PCT
         )
         if is_double_sure:
-            side = 'sell'
+            # Detect which big candle we're looking at
+            big_candle_to_check = big_candle if is_rising else big_candle_f
+            
+            if is_bearish(big_candle_to_check):  # RED candle
+                side = 'buy'
+                is_double_sure_red = True
+                signal_msg = (
+                    f"Double Sure Bet | Upper:{upper_w:.1f}% Lower:{lower_w:.1f}% "
+                    f"Body:{candle_change_pct:.2f}% → BUY (Red Rejection)"
+                )
+            else:  # GREEN candle
+                side = 'sell'
+                is_double_sure_red = False
+                signal_msg = (
+                    f"Double Sure Bet | Upper:{upper_w:.1f}% Lower:{lower_w:.1f}% "
+                    f"Body:{candle_change_pct:.2f}% → SELL (Green Rejection)"
+                )
             is_reversal = True
-            signal_msg = (
-                f"Double Sure Bet | Upper:{upper_w:.1f}% Lower:{lower_w:.1f}% "
-                f"Body:{candle_change_pct:.2f}% → SELL"
-            )
 
 # ==========================
 # ETH FILTER (bypassed entirely for a Double Sure Bet)
@@ -1217,21 +1269,25 @@ async def process_symbol(symbol, timeframe):
         filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
         dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
-            symbol, eth_trend, side, is_reversal, big_open, filled_price, is_double_sure
+            symbol, eth_trend, side, is_reversal, big_open, filled_price, is_double_sure, is_double_sure_red
         )
 
         # Place DCA1 (and DCA2, if this scheme has one) as resting limit orders
-        if dca_scheme == 'bullish_long':
+        if dca_scheme == 'double_sure':
+            dca1_capital = DOUBLE_SURE_RED_DCA1_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA1_CAPITAL
+        elif dca_scheme == 'bullish_long':
             dca1_capital = BULLISH_DCA1_CAPITAL
-        elif dca_scheme == 'double_sure':
-            dca1_capital = DOUBLE_SURE_DCA1_CAPITAL
         else:
             dca1_capital = SIDEWAYS_DCA1_CAPITAL
+            
         dca1_order = await place_dca_limit_order(symbol, side, dca1_capital, dca1_level, 'DCA1')
 
         dca2_order = None
         if dca2_level is not None:
-            dca2_capital = DOUBLE_SURE_DCA2_CAPITAL if dca_scheme == 'double_sure' else SIDEWAYS_DCA2_CAPITAL
+            if dca_scheme == 'double_sure':
+                dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
+            else:
+                dca2_capital = SIDEWAYS_DCA2_CAPITAL
             dca2_order = await place_dca_limit_order(symbol, side, dca2_capital, dca2_level, 'DCA2')
 
         opposite_side = 'sell' if side == 'buy' else 'buy'
@@ -1270,6 +1326,7 @@ async def process_symbol(symbol, timeframe):
             'is_danger': is_danger,
             'is_caution': is_caution,
             'is_double_sure': is_double_sure,
+            'is_double_sure_red': is_double_sure_red,
             'upper_wick_pct': upper_w,
             'lower_wick_pct': lower_w,
         }
@@ -1287,7 +1344,7 @@ async def process_symbol(symbol, timeframe):
     except ccxt.InsufficientFunds:
 
         dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
-            symbol, eth_trend, side, is_reversal, big_open, entry_price, is_double_sure
+            symbol, eth_trend, side, is_reversal, big_open, entry_price, is_double_sure, is_double_sure_red
         )
 
         required_margin = DOUBLE_SURE_CAPITAL if is_double_sure else CAPITAL_INITIAL
@@ -1305,6 +1362,7 @@ async def process_symbol(symbol, timeframe):
             'dca_scheme': dca_scheme,
             'dca1_level': dca1_level,
             'dca2_level': dca2_level,
+            'is_double_sure_red': is_double_sure_red,
         }
         projected = compute_projected_tps(symbol, temp_tr)
 

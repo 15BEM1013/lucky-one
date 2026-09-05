@@ -82,6 +82,8 @@ MAX_OPEN_TRADES = 5
 
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
+ETH_HISTORY_FILE = 'eth_history.json'
+ETH_HISTORY_MAX = 50  # keep last N ETH FILTER snapshots (only last 3 are ever needed per signal)
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_SECRET')
@@ -115,6 +117,24 @@ def load_trades():
     except Exception as e:
         logging.error(f"Load trades error: {e}")
         open_trades = {}
+
+def save_eth_history():
+    try:
+        with open(ETH_HISTORY_FILE, 'w') as f:
+            json.dump(eth_history, f)
+    except Exception as e:
+        logging.error(f"Save ETH history error: {e}")
+
+def load_eth_history():
+    global eth_history
+    try:
+        if os.path.exists(ETH_HISTORY_FILE):
+            with open(ETH_HISTORY_FILE, 'r') as f:
+                eth_history = json.load(f)
+            logging.info(f"Loaded {len(eth_history)} ETH history snapshots")
+    except Exception as e:
+        logging.error(f"Load ETH history error: {e}")
+        eth_history = []
 
 def save_closed_trade(closed):
     try:
@@ -174,6 +194,10 @@ eth_last_candle = None
 eth_ema9 = 0.0
 eth_ema21 = 0.0
 eth_ema_gap = 0.0
+
+# Rolling history of ETH FILTER snapshots: [{'time': candle_open_ms, 'ema9': float, 'ema21': float}, ...]
+# One entry per actual ETH FILTER message sent (i.e. per new 1h candle), oldest first.
+eth_history = []
 
 # ===========================
 # ETH MARKET PHASE ANALYSIS
@@ -451,6 +475,67 @@ def get_avg_entry_and_total(tr):
     weighted = sum(e['price'] * e['amount'] for e in tr['entries'])
     return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
 
+# ===========================
+# ETH EMA SYNC FILTER
+# ===========================
+# Looks backward only, at the last 3 ETH FILTER messages sent strictly
+# before a given signal (ignores everything else in between - other
+# signals, TP/SL hits, warnings, restarts, summaries). EMA Gap is ignored;
+# only EMA9 vs EMA21 direction matters, checked per consecutive transition:
+#   - both UP           -> pass
+#   - both DOWN         -> pass
+#   - both reverse together (e.g. UP/UP then DOWN/DOWN) -> pass
+#   - move opposite in ANY transition -> reject
+def _ema_direction(prev_val, curr_val):
+    if curr_val > prev_val:
+        return "UP"
+    elif curr_val < prev_val:
+        return "DOWN"
+    return "FLAT"
+
+def check_eth_ema_sync(signal_time):
+    """
+    Returns (passed, conflicts, snapshots_used).
+      passed         -> bool
+      conflicts      -> list of (transition_index, dir9, dir21) tuples that
+                         diverged (empty if passed, or if skipped)
+      snapshots_used -> the up-to-3 ETH history snapshots actually used
+                         (empty list if skipped for insufficient history)
+
+    If fewer than 3 ETH FILTER snapshots exist before signal_time (e.g. bot
+    just started), the filter is skipped (treated as a pass) rather than
+    blocking every trade until enough history builds up.
+    """
+    past = [h for h in eth_history if h['time'] < signal_time]
+    if len(past) < 3:
+        return True, [], []
+
+    last3 = past[-3:]
+    conflicts = []
+    for i in range(len(last3) - 1):
+        prev, curr = last3[i], last3[i + 1]
+        dir9 = _ema_direction(prev['ema9'], curr['ema9'])
+        dir21 = _ema_direction(prev['ema21'], curr['ema21'])
+        opposite = (dir9 == "UP" and dir21 == "DOWN") or (dir9 == "DOWN" and dir21 == "UP")
+        if opposite:
+            conflicts.append((i, dir9, dir21))
+
+    return len(conflicts) == 0, conflicts, last3
+
+def build_eth_sync_reject_message(symbol, side, pattern, last3, conflicts):
+    lines = ["━━━━━━━━━━━━━━━", "🚫 EMA SYNC FILTER REJECTED", "━━━━━━━━━━━━━━━"]
+    lines.append(f"{'🟢 LONG' if side == 'buy' else '🔴 SHORT'} {symbol}")
+    lines.append(f"🔍 Pattern: {pattern}")
+    lines.append("")
+    lines.append("Last 3 ETH FILTER snapshots:")
+    for h in last3:
+        t = datetime.fromtimestamp(h['time'] / 1000, pytz.timezone('Asia/Kolkata')).strftime('%H:%M')
+        lines.append(f"{t} — EMA9: {h['ema9']:.2f} | EMA21: {h['ema21']:.2f}")
+    lines.append("")
+    conflict_lines = [f"Transition {idx + 1}→{idx + 2}: EMA9 {dir9} vs EMA21 {dir21} (opposite)" for idx, dir9, dir21 in conflicts]
+    lines.append("⚠️ " + " | ".join(conflict_lines))
+    return "\n".join(lines)
+
 # === TREND-BASED TRADE PLAN ===
 def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False):
     """
@@ -475,7 +560,7 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 
     if is_double_sure:
         dca_scheme = 'double_sure'
-        
+
         if is_double_sure_red:  # RED candle BUY
             tp_pct = DOUBLE_SURE_RED_TP_INITIAL
             dca1_level = ref_price * (1 - DOUBLE_SURE_RED_DCA1_TRIGGER_PCT)
@@ -484,7 +569,7 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
             tp_pct = DOUBLE_SURE_GREEN_TP_INITIAL
             dca1_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT)
             dca2_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT)
-        
+
         sl_reference_price = ref_price
     elif use_bullish_long_scheme:
         dca_scheme = 'bullish_long'
@@ -543,28 +628,28 @@ def compute_projected_tps(sym, tr):
     else:
         initial_price = tr['entries'][0]['price']
         initial_amount = tr['entries'][0]['amount']
-        
+
         if scheme == 'double_sure':
             dca1_capital = DOUBLE_SURE_RED_DCA1_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA1_CAPITAL
         elif scheme == 'bullish_long':
             dca1_capital = BULLISH_DCA1_CAPITAL
         else:
             dca1_capital = SIDEWAYS_DCA1_CAPITAL
-            
+
         dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
         cum_amount = initial_amount + dca1_amount
         cum_weighted = initial_price * initial_amount + dca1_level * dca1_amount
 
     if cum_amount > 0:
         avg1 = cum_weighted / cum_amount
-        
+
         if scheme == 'double_sure':
             tp_pct1 = DOUBLE_SURE_RED_TP_AFTER_DCA1 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA1
         elif scheme == 'bullish_long':
             tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT
         else:
             tp_pct1 = SIDEWAYS_TP_AFTER_DCA1_PCT
-            
+
         tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
         result['after_dca1'] = round_price(sym, tp1)
         result['dca1_filled'] = dca_stage >= 1
@@ -790,7 +875,7 @@ async def handle_dca_filled(sym, tr, order, stage):
         filled_amount = order.get('filled') or order.get('amount')
         scheme = tr.get('dca_scheme', 'sideways')
         is_double_sure_red = tr.get('is_double_sure_red', False)
-        
+
         if scheme == 'bullish_long':
             capital = BULLISH_DCA1_CAPITAL
         elif scheme == 'double_sure':
@@ -815,7 +900,7 @@ async def handle_dca_filled(sym, tr, order, stage):
         tr[f'dca{stage}_order_id'] = None  # this leg is filled, nothing left to track
 
         is_long = tr['side'] == 'buy'
-        
+
         if scheme == 'bullish_long':
             tp_pct = BULLISH_TP_AFTER_DCA1_PCT
         elif scheme == 'double_sure':
@@ -956,6 +1041,7 @@ async def update_eth_trend():
     global eth_ema9
     global eth_ema21
     global eth_ema_gap
+    global eth_history
 
     try:
 
@@ -1047,6 +1133,18 @@ async def update_eth_trend():
         eth_ema9 = calculate_ema(closes, 9)
         eth_ema21 = calculate_ema(closes, 21)
         eth_ema_gap = abs(eth_ema9 - eth_ema21) / eth_ema21 * 100
+
+        # Record this ETH FILTER snapshot for the EMA-sync signal filter.
+        # This only runs once per new 1h candle (see the early-return above),
+        # so it lines up 1:1 with an actual ETH FILTER message being sent.
+        eth_history.append({
+            'time': candles[-1][0],
+            'ema9': eth_ema9,
+            'ema21': eth_ema21,
+        })
+        if len(eth_history) > ETH_HISTORY_MAX:
+            del eth_history[:-ETH_HISTORY_MAX]
+        save_eth_history()
 
         if latest == "🔴 Bearish Momentum Building":
             eth_phase = "BEARISH_MOMENTUM"
@@ -1194,7 +1292,7 @@ async def process_symbol(symbol, timeframe):
         if is_double_sure:
             # Detect which big candle we're looking at
             big_candle_to_check = big_candle if is_rising else big_candle_f
-            
+
             if is_bearish(big_candle_to_check):  # RED candle
                 side = 'buy'
                 is_double_sure_red = True
@@ -1243,6 +1341,20 @@ async def process_symbol(symbol, timeframe):
             logging.info(f"{symbol} rejected - Bearish")
             return
 
+        # ==========================
+        # ETH EMA SYNC FILTER (new)
+        # ==========================
+        # Applies to every signal that reaches this point (including Double
+        # Sure Bets). Unlike the trend filter above, a rejection here IS
+        # reported to Telegram - every other rejection above stays silent
+        # (log-only), same as before.
+        sync_passed, sync_conflicts, sync_snapshots = check_eth_ema_sync(signal_time)
+        if not sync_passed:
+            reject_msg = build_eth_sync_reject_message(symbol, side, pattern, sync_snapshots, sync_conflicts)
+            await send_telegram(reject_msg)
+            logging.info(f"{symbol} rejected - EMA sync filter")
+            return
+
         await prepare_symbol(symbol)
 
         # 24h % change for this symbol (used for the danger/caution flag)
@@ -1279,7 +1391,7 @@ async def process_symbol(symbol, timeframe):
             dca1_capital = BULLISH_DCA1_CAPITAL
         else:
             dca1_capital = SIDEWAYS_DCA1_CAPITAL
-            
+
         dca1_order = await place_dca_limit_order(symbol, side, dca1_capital, dca1_level, 'DCA1')
 
         dca2_order = None
@@ -1457,6 +1569,7 @@ async def main():
     markets = exchange.markets
     symbols = get_symbols(markets)
     load_trades()
+    load_eth_history()
     await update_eth_trend()
 
     logging.info(f"Starting bot with {len(symbols)} symbols")

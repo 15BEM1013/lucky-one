@@ -1,0 +1,1477 @@
+import ccxt.async_support as ccxt
+import asyncio
+import aiohttp
+import time
+import json
+import os
+import logging
+from dotenv import load_dotenv
+from datetime import datetime
+import pytz
+import math
+
+# Load .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
+
+# === CONFIG ===
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TIMEFRAMES = ['5m', '15m']
+CANDLE_LIMIT = 12
+MIN_BIG_BODY_PCT = 1.0
+MAX_SMALL_BODY_PCT = 0.1
+MIN_LOWER_WICK_PCT = 20.0
+BATCH_DELAY = 2.0
+NUM_CHUNKS = 8
+
+# TRADE SETTINGS
+CAPITAL_INITIAL = 10.0
+LEVERAGE = 9
+
+# --- Bullish-trend continuation LONG scheme ---
+BULLISH_DCA1_TRIGGER_PCT = 0.2 / 100   # big-candle open + 0.2%
+BULLISH_DCA1_CAPITAL = 20.0
+BULLISH_TP_AFTER_DCA1_PCT = 0.8 / 100  # from new avg entry
+BULLISH_SL_PCT = 3.5 / 100             # fixed, off big-candle open price
+BULLISH_TP_INITIAL_PCT = 1.0 / 100     # unchanged, no-DCA case
+
+# --- Sideways-trend SHORT scheme (also used for bullish-reversal SHORTs) ---
+SIDEWAYS_DCA1_TRIGGER_PCT = 1.0 / 100  # from entry price
+SIDEWAYS_DCA1_CAPITAL = 20.0
+SIDEWAYS_TP_AFTER_DCA1_PCT = 0.8 / 100
+SIDEWAYS_DCA2_TRIGGER_PCT = 3.0 / 100  # from entry price (not from DCA1)
+SIDEWAYS_DCA2_CAPITAL = 10.0
+SIDEWAYS_TP_AFTER_DCA2_PCT = 0.6 / 100
+SIDEWAYS_SL_PCT = 5.0 / 100            # fixed, off entry price
+SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
+
+# --- "Double Sure Bet" scheme ---
+# Triggered when the big candle's upper AND lower wick are both >10% of its
+# body, OR the big candle's body is itself >3% (a huge-range candle).
+# Side depends on candle color: RED candle → BUY, GREEN candle → SELL
+DOUBLE_SURE_WICK_PCT = 10.0            # both wicks must exceed this % of body
+DOUBLE_SURE_BIG_CANDLE_PCT = 3.0       # OR: big-candle body % this large
+DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin
+DOUBLE_SURE_SL_PCT = 8.0 / 100          # fixed, off entry price
+
+# --- GREEN Candle (SELL) - Decreasing TP as positions add ---
+DOUBLE_SURE_GREEN_TP_INITIAL = 1.0 / 100
+DOUBLE_SURE_GREEN_TP_AFTER_DCA1 = 0.8 / 100
+DOUBLE_SURE_GREEN_TP_AFTER_DCA2 = 0.6 / 100
+DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT = 1.5 / 100
+DOUBLE_SURE_GREEN_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
+DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
+
+# --- RED Candle (BUY) - Different structure ---
+DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
+DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 0.5 / 100
+DOUBLE_SURE_RED_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_RED_TP_AFTER_DCA1 = 2.0 / 100
+DOUBLE_SURE_RED_DCA2_TRIGGER_PCT = 3.0 / 100
+DOUBLE_SURE_RED_DCA2_CAPITAL = 10.0
+DOUBLE_SURE_RED_TP_AFTER_DCA2 = 1.5 / 100
+
+# --- Volatility flag thresholds ---
+CANDLE_FLAG_PCT = 2.0     # big-candle body % change threshold
+DAY_DANGER_PCT = 10.0     # 24h % change threshold for the "danger" tier
+
+TP_CHECK_INTERVAL = 0.5      # SL price-poll interval
+ORDER_CHECK_INTERVAL = 2.0   # DCA1/DCA2/TP resting-limit-order fill-check interval
+MAX_OPEN_TRADES = 5
+
+TRADE_FILE = 'open_trades.json'
+CLOSED_TRADE_FILE = 'closed_trades.json'
+
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_SECRET')
+
+if not API_KEY or not API_SECRET:
+    raise ValueError("BINANCE_API_KEY and BINANCE_SECRET must be set")
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+trade_lock = asyncio.Lock()
+
+def get_ist_time():
+    return datetime.now(pytz.timezone('Asia/Kolkata'))
+
+# === TRADE PERSISTENCE ===
+def save_trades():
+    try:
+        with open(TRADE_FILE, 'w') as f:
+            json.dump(open_trades, f, default=str)
+        logging.info(f"Trades saved ({len(open_trades)} open)")
+    except Exception as e:
+        logging.error(f"Save trades error: {e}")
+
+def load_trades():
+    global open_trades
+    try:
+        if os.path.exists(TRADE_FILE):
+            with open(TRADE_FILE, 'r') as f:
+                open_trades = json.load(f)
+            logging.info(f"Loaded {len(open_trades)} open trades")
+    except Exception as e:
+        logging.error(f"Load trades error: {e}")
+        open_trades = {}
+
+def save_closed_trade(closed):
+    try:
+        closed_list = []
+        if os.path.exists(CLOSED_TRADE_FILE):
+            with open(CLOSED_TRADE_FILE, 'r') as f:
+                closed_list = json.load(f)
+        closed_list.append(closed)
+        with open(CLOSED_TRADE_FILE, 'w') as f:
+            json.dump(closed_list, f, default=str)
+        logging.info(f"Closed trade saved | PnL: ${closed.get('pnl_usdt', 0):.2f}")
+    except Exception as e:
+        logging.error(f"Save closed trade error: {e}")
+
+# === TELEGRAM ===
+async def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                r = await resp.json()
+                return r.get('result', {}).get('message_id')
+    except Exception as e:
+        logging.error(f"Telegram send error: {e}")
+        return None
+
+async def edit_telegram_message(mid, new_text):
+    if not mid: return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, data={'chat_id': CHAT_ID, 'message_id': mid, 'text': new_text, 'parse_mode': 'Markdown'}, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        logging.error(f"Telegram edit error: {e}")
+
+# === EXCHANGE ===
+async def initialize_exchange():
+    ex = ccxt.binance({
+        'apiKey': API_KEY,
+        'secret': API_SECRET,
+        'options': {'defaultType': 'future', 'marginMode': 'isolated'},
+        'enableRateLimit': True,
+    })
+    await ex.load_markets()
+    logging.info("Connected to Binance Futures")
+    return ex
+
+exchange = None
+sent_signals = {}
+open_trades = {}
+prepared_symbols = set()  # symbols where margin mode / leverage already set this run
+
+eth_trend = "SIDEWAYS"
+eth_phase = "INDECISION"
+eth_last_candle = None
+
+eth_ema9 = 0.0
+eth_ema21 = 0.0
+eth_ema_gap = 0.0
+
+# ===========================
+# ETH MARKET PHASE ANALYSIS
+# ===========================
+
+eth_market_phases = []
+eth_phase_text = ""
+
+# === HELPERS ===
+def format_duration(seconds):
+    if seconds < 60: return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60: return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    minutes = minutes % 60
+    return f"{hours}h {minutes}m"
+
+def is_bullish(c): return c[4] > c[1]
+def is_bearish(c): return c[4] < c[1]
+def body_pct(c): return abs(c[4] - c[1]) / c[1] * 100 if c[1] != 0 else 0
+
+def lower_wick_pct(c):
+    o, h, l, cc = c[1], c[2], c[3], c[4]
+    body = abs(cc - o)
+    if body == 0: return 0
+    lower = min(o, cc) - l
+    return (lower / body) * 100
+
+def upper_wick_pct(c):
+    o, h, l, cc = c[1], c[2], c[3], c[4]
+    body = abs(cc - o)
+    if body == 0: return 0
+    upper = h - max(o, cc)
+    return (upper / body) * 100
+
+def get_wick_signal(candle):
+    if body_pct(candle) < 0.5:
+        return None, None, False
+
+    upper = upper_wick_pct(candle)
+    lower = lower_wick_pct(candle)
+    is_green = is_bullish(candle)
+
+    # GREEN CANDLE
+    if is_green:
+
+        if (
+            upper > 50
+            or lower > 30
+            or (upper > 30 and lower > 30)
+        ):
+            return (
+                'sell',
+                f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → SELL",
+                True
+            )
+
+        return (
+            'buy',
+            f"Green Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → BUY",
+            False
+        )
+
+    # RED CANDLE
+    else:
+
+        if lower > 30 or (upper > 30 and lower > 30):
+            return None, None, False
+
+        return (
+            'sell',
+            f"Red Candle | Upper:{upper:.1f}% Lower:{lower:.1f}% → SELL",
+            False
+        )
+def round_price(symbol, price):
+    try:
+        m = exchange.market(symbol)
+        tick = float(m['info']['filters'][0]['tickSize'])
+        prec = int(round(-math.log10(tick)))
+        return round(price, prec)
+    except:
+        return price
+
+def round_amount(symbol, amt):
+    try:
+        return float(exchange.amount_to_precision(symbol, amt))
+    except:
+        return amt
+
+
+# ===========================
+# EMA CALCULATION
+# ===========================
+
+def calculate_ema(prices, period):
+
+    multiplier = 2 / (period + 1)
+
+    ema = sum(prices[:period]) / period
+
+    for price in prices[period:]:
+        ema = ((price - ema) * multiplier) + ema
+
+    return ema
+
+
+# ===========================
+# MARKET PHASE NAME
+# ===========================
+
+def phase_name(direction, ema9_dir, ema21_dir, gap_dir):
+
+    # ==========================
+    # BULLISH
+    # ==========================
+    if direction == "BULLISH":
+
+        if ema9_dir == "UP" and ema21_dir == "UP":
+
+            if gap_dir == "UP":
+                return "🟢 Bullish Momentum Building"
+
+            return "🟡 Bullish Momentum Fading"
+
+        if ema9_dir == "UP" and ema21_dir == "DOWN":
+            return "🟢 Bullish Recovery"
+
+        if ema9_dir == "DOWN" and ema21_dir == "UP":
+            return "🟠 Bullish Pullback"
+
+        return "🟡 Bullish Indecision"
+
+    # ==========================
+    # BEARISH
+    # ==========================
+    elif direction == "BEARISH":
+
+        if ema9_dir == "DOWN" and ema21_dir == "DOWN":
+
+            if gap_dir == "UP":
+                return "🔴 Bearish Momentum Building"
+
+            return "🟠 Bearish Momentum Fading"
+
+        if ema9_dir == "DOWN" and ema21_dir == "UP":
+            return "🔴 Bearish Recovery"
+
+        if ema9_dir == "UP" and ema21_dir == "DOWN":
+            return "🟡 Bearish Pullback"
+
+        return "🟠 Bearish Indecision"
+
+    # ==========================
+    # SIDEWAYS
+    # ==========================
+    else:
+
+        if ema9_dir == "UP" and gap_dir == "UP":
+            return "⚪ Sideways (Bullish Bias)"
+
+        if ema9_dir == "DOWN" and gap_dir == "UP":
+            return "⚪ Sideways (Bearish Bias)"
+
+        if gap_dir == "DOWN":
+            return "🟣 Market Compression"
+
+        return "⚪ Transition / Indecision"
+
+# ===========================
+# NEXT PHASE PREDICTION
+# ===========================
+
+def predict_next_phase(last_phase):
+
+    # ==========================
+    # BEARISH
+    # ==========================
+
+    if last_phase == "🔴 Bearish Momentum Building":
+        return "🟠 Bearish Momentum Fading", "High"
+
+    elif last_phase == "🟠 Bearish Momentum Fading":
+        return "⚪ Sideways (Bullish Bias)", "Medium"
+
+    elif last_phase == "🔴 Bearish Recovery":
+        return "🟠 Bearish Momentum Fading", "Medium"
+
+    elif last_phase == "🟡 Bearish Pullback":
+        return "🔴 Bearish Momentum Building", "Medium"
+
+    elif last_phase == "🟠 Bearish Indecision":
+        return "⚪ Sideways (Bearish Bias)", "Low"
+
+    # ==========================
+    # SIDEWAYS
+    # ==========================
+
+    elif last_phase == "⚪ Sideways (Bullish Bias)":
+        return "🟢 Bullish Momentum Building", "High"
+
+    elif last_phase == "⚪ Sideways (Bearish Bias)":
+        return "🔴 Bearish Momentum Building", "High"
+
+    elif last_phase == "🟣 Market Compression":
+        return "⚡ Strong Breakout Expected", "Medium"
+
+    elif last_phase == "⚪ Transition / Indecision":
+        return "Waiting for Confirmation", "Low"
+
+    # ==========================
+    # BULLISH
+    # ==========================
+
+    elif last_phase == "🟢 Bullish Recovery":
+        return "🟢 Bullish Momentum Building", "High"
+
+    elif last_phase == "🟢 Bullish Momentum Building":
+        return "🚀 Bullish Breakout", "High"
+
+    elif last_phase == "🚀 Bullish Breakout":
+        return "🟢 Bullish Trend Continuation", "High"
+
+    elif last_phase == "🟡 Bullish Momentum Fading":
+        return "⚪ Sideways", "Medium"
+
+    elif last_phase == "🟠 Bullish Pullback":
+        return "🟢 Bullish Momentum Building", "Medium"
+
+    elif last_phase == "🟡 Bullish Indecision":
+        return "⚪ Sideways (Bullish Bias)", "Low"
+
+    return "Unknown", "Low"
+
+# === PATTERN DETECTION ===
+def detect_rising_three(candles):
+    if len(candles) < 9: return False, None
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8]]
+    big_vol = c2[5]
+    vol_condition = all(big_vol > v for v in prev_volumes)
+
+    big_green = (is_bullish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and vol_condition)
+    small_red_1 = is_bearish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
+    small_red_0 = is_bearish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
+    return big_green and small_red_1 and small_red_0, c2
+
+def detect_falling_three(candles):
+    if len(candles) < 9: return False, None
+    c2, c1, c0 = candles[-4], candles[-3], candles[-2]
+    prev_volumes = [candles[i][5] for i in [-5, -6, -7, -8]]
+    big_vol = c2[5]
+    vol_condition = all(big_vol > v for v in prev_volumes)
+
+    big_red = (is_bearish(c2) and body_pct(c2) >= MIN_BIG_BODY_PCT and vol_condition)
+    small_green_1 = is_bullish(c1) and body_pct(c1) < MAX_SMALL_BODY_PCT and lower_wick_pct(c1) >= MIN_LOWER_WICK_PCT
+    small_green_0 = is_bullish(c0) and body_pct(c0) < MAX_SMALL_BODY_PCT and lower_wick_pct(c0) >= MIN_LOWER_WICK_PCT
+    return big_red and small_green_1 and small_green_0, c2
+
+def get_symbols(markets):
+    return [s for s in markets if 'USDT' in s and markets[s].get('swap') and markets[s].get('active', True)]
+
+async def prepare_symbol(symbol):
+    if symbol in prepared_symbols:
+        return
+    try:
+        await exchange.set_margin_mode('isolated', symbol)
+        await exchange.set_leverage(LEVERAGE, symbol)
+        prepared_symbols.add(symbol)
+    except Exception as e:
+        logging.warning(f"Prepare {symbol} failed: {e}")
+
+def get_avg_entry_and_total(tr):
+    total_pos = sum(e['amount'] for e in tr['entries'])
+    weighted = sum(e['price'] * e['amount'] for e in tr['entries'])
+    return (weighted / total_pos) if total_pos > 0 else 0.0, total_pos
+
+# === TREND-BASED TRADE PLAN ===
+def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False):
+    """
+    Decides which DCA/TP/SL scheme a trade uses, and computes the initial
+    levels for it.
+
+    ref_price = filled_price (order succeeded) or last known ticker/entry
+    price (InsufficientFunds fallback, order never filled).
+
+    Three schemes:
+      - 'double_sure': the double-wick / big-candle override SHORT/BUY.
+        Color-dependent TP structure.
+      - 'bullish_long': ETH-bullish trend, continuation LONG (Rising Three,
+        non-reversal, buy side) only.
+      - 'sideways': everything else that reaches this point.
+
+    Returns: (dca_scheme, tp, dca1_level, dca2_level_or_None, sl_reference_price)
+    All price values are rounded to the symbol's tick size.
+    """
+    is_long = side == 'buy'
+    use_bullish_long_scheme = (eth_trend_now == "BULLISH" and is_long and not is_reversal)
+
+    if is_double_sure:
+        dca_scheme = 'double_sure'
+        
+        if is_double_sure_red:  # RED candle BUY
+            tp_pct = DOUBLE_SURE_RED_TP_INITIAL
+            dca1_level = ref_price * (1 - DOUBLE_SURE_RED_DCA1_TRIGGER_PCT)
+            dca2_level = ref_price * (1 - DOUBLE_SURE_RED_DCA2_TRIGGER_PCT)
+        else:  # GREEN candle SELL
+            tp_pct = DOUBLE_SURE_GREEN_TP_INITIAL
+            dca1_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT)
+            dca2_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT)
+        
+        sl_reference_price = ref_price
+    elif use_bullish_long_scheme:
+        dca_scheme = 'bullish_long'
+        tp_pct = BULLISH_TP_INITIAL_PCT
+        dca1_level = big_open * (1 + BULLISH_DCA1_TRIGGER_PCT)
+        dca2_level = None
+        sl_reference_price = big_open
+    else:
+        dca_scheme = 'sideways'
+        tp_pct = SIDEWAYS_TP_INITIAL_PCT
+        dca1_level = ref_price * (1 - SIDEWAYS_DCA1_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA1_TRIGGER_PCT)
+        dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
+        sl_reference_price = ref_price
+
+    tp = round_price(symbol, ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct))
+    dca1_level = round_price(symbol, dca1_level)
+    dca2_level = round_price(symbol, dca2_level) if dca2_level is not None else None
+    sl_reference_price = round_price(symbol, sl_reference_price)
+
+    return dca_scheme, tp, dca1_level, dca2_level, sl_reference_price
+
+# === PROJECTED TP (before DCA legs actually fill) ===
+def compute_projected_tps(sym, tr):
+    """
+    Build the full TP chain: the original (immutable) initial TP, plus the
+    TP-after-DCA1 / TP-after-DCA2 levels — using REAL fill price/amount for
+    any DCA leg that has already filled, and a PROJECTION off the resting
+    dca1_level/dca2_level for any leg that hasn't filled yet. This works
+    identically for LONG and SHORT trades since it operates purely on
+    weighted averages and the is_long flag controls TP direction.
+
+    Returns a dict:
+      'initial'      -> original TP set at trade open (never mutated)
+      'after_dca1'   -> present if dca1_level exists
+      'dca1_filled'  -> True if DCA1 has actually filled
+      'after_dca2'   -> present if dca2_level exists (sideways/double_sure schemes only)
+      'dca2_filled'  -> True if DCA2 has actually filled
+    """
+    is_long = tr['side'] == 'buy'
+    scheme = tr.get('dca_scheme', 'sideways')
+    dca_stage = tr.get('dca_stage', 0)
+    is_double_sure_red = tr.get('is_double_sure_red', False)
+
+    # Original TP, fixed at trade creation — never touched by handle_dca_filled
+    result = {'initial': tr.get('tp_initial', tr['tp'])}
+
+    dca1_level = tr.get('dca1_level')
+    if not dca1_level:
+        return result
+
+    # --- Stage 1: DCA1 filled or projected ---
+    if dca_stage >= 1:
+        stage1_entries = [e for e in tr['entries'] if e['stage'] <= 1]
+        cum_amount = sum(e['amount'] for e in stage1_entries)
+        cum_weighted = sum(e['price'] * e['amount'] for e in stage1_entries)
+    else:
+        initial_price = tr['entries'][0]['price']
+        initial_amount = tr['entries'][0]['amount']
+        
+        if scheme == 'double_sure':
+            dca1_capital = DOUBLE_SURE_RED_DCA1_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA1_CAPITAL
+        elif scheme == 'bullish_long':
+            dca1_capital = BULLISH_DCA1_CAPITAL
+        else:
+            dca1_capital = SIDEWAYS_DCA1_CAPITAL
+            
+        dca1_amount = round_amount(sym, (dca1_capital * LEVERAGE) / dca1_level)
+        cum_amount = initial_amount + dca1_amount
+        cum_weighted = initial_price * initial_amount + dca1_level * dca1_amount
+
+    if cum_amount > 0:
+        avg1 = cum_weighted / cum_amount
+        
+        if scheme == 'double_sure':
+            tp_pct1 = DOUBLE_SURE_RED_TP_AFTER_DCA1 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA1
+        elif scheme == 'bullish_long':
+            tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT
+        else:
+            tp_pct1 = SIDEWAYS_TP_AFTER_DCA1_PCT
+            
+        tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
+        result['after_dca1'] = round_price(sym, tp1)
+        result['dca1_filled'] = dca_stage >= 1
+
+    # --- Stage 2: DCA2 filled or projected (sideways / double_sure schemes only) ---
+    dca2_level = tr.get('dca2_level')
+    if dca2_level and scheme != 'bullish_long':
+        if scheme == 'double_sure':
+            dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
+            tp_pct2 = DOUBLE_SURE_RED_TP_AFTER_DCA2 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
+        else:
+            dca2_capital = SIDEWAYS_DCA2_CAPITAL
+            tp_pct2 = SIDEWAYS_TP_AFTER_DCA2_PCT
+
+        if dca_stage >= 2:
+            stage2_entries = [e for e in tr['entries'] if e['stage'] <= 2]
+            cum_amount2 = sum(e['amount'] for e in stage2_entries)
+            cum_weighted2 = sum(e['price'] * e['amount'] for e in stage2_entries)
+        else:
+            dca2_amount = round_amount(sym, (dca2_capital * LEVERAGE) / dca2_level)
+            cum_amount2 = cum_amount + dca2_amount
+            cum_weighted2 = cum_weighted + dca2_level * dca2_amount
+
+        if cum_amount2 > 0:
+            avg2 = cum_weighted2 / cum_amount2
+            tp2 = avg2 * (1 + tp_pct2) if is_long else avg2 * (1 - tp_pct2)
+            result['after_dca2'] = round_price(sym, tp2)
+            result['dca2_filled'] = dca_stage >= 2
+
+    return result
+
+# === BUILD TRADE MESSAGE ===
+def build_trade_message(tr, sym, current=None, is_final=False, hit_type=None, exit_price=None, pnl_usdt=None, pnl_pct=None):
+    """
+    Builds the full trade message. Used both for the live/open trade post
+    (and its edits on DCA fills) AND for the final TP/SL-hit edit — the two
+    share every section (entries, wick, TP path, SL, candle/day change,
+    pattern) so nothing is lost when a trade closes; only the header and a
+    trailing exit/PnL block differ.
+    """
+    is_long = tr['side'] == 'buy'
+    duration = format_duration(time.time() - tr['open_ts'])
+    avg = tr['avg_entry']
+    scheme = tr.get('dca_scheme', 'sideways')
+    divider = "━━━━━━━━━━━━━━━"
+
+    lines = [divider]
+
+    if is_final and hit_type:
+        icon = "✅" if hit_type == "TP" else "❌"
+        lines.append(f"{icon} {hit_type} HIT — {'LONG' if is_long else 'SHORT'} {sym}")
+    else:
+        if tr.get('is_double_sure'):
+            lines.append("🎯 DOUBLE SURE BET")
+        if tr.get('is_danger'):
+            lines.append("⚡ HIGH VOLATILITY")
+        elif tr.get('is_caution'):
+            lines.append("🔸 SHARP MOVE")
+        side_icon = "🟢 LONG" if is_long else "🔴 SHORT"
+        lines.append(f"{side_icon} {sym}")
+
+    lines.append(divider)
+
+    total_margin = sum(e['margin'] for e in tr['entries'])
+    lines.append(f"📥 Entry: `{tr['initial_price']:.6f}`  ⏱ {tr.get('timeframe', 'N/A')}")
+    lines.append(f"💰 Margin: ${total_margin:g}")
+    lines.append("")
+
+    entries_str = [f"{'Initial' if e['stage']==0 else 'DCA'+str(e['stage'])}: {e['price']:.6f} (${e['margin']:g})" for e in tr['entries']]
+    lines.append("Entries: " + " | ".join(entries_str))
+    if len(tr['entries']) > 1:
+        lines.append(f"Avg: `{avg:.6f}`")
+    lines.append("")
+
+    # Resting DCA order prices only matter while the trade is still open —
+    # once it's closed (is_final) any unfilled legs have been cancelled.
+    if not is_final:
+        dca_stage = tr.get('dca_stage', 0)
+        dca_order_lines = []
+        if tr.get('dca1_level') is not None and dca_stage < 1:
+            dca_order_lines.append(f"DCA1: `{tr['dca1_level']:.6f}`")
+        if tr.get('dca2_level') is not None and dca_stage < 2:
+            dca_order_lines.append(f"DCA2: `{tr['dca2_level']:.6f}`")
+        if dca_order_lines:
+            lines.append("🧩 DCA Orders: " + " | ".join(dca_order_lines))
+            lines.append("")
+
+    projected = compute_projected_tps(sym, tr)
+    tp_chain = f"{tr['initial_price']:.6f} → {projected['initial']:.6f}"
+    if 'after_dca1' in projected:
+        tag = "DCA1 ✓" if projected.get('dca1_filled') else "DCA1"
+        tp_chain += f" → {projected['after_dca1']:.6f} ({tag})"
+    if 'after_dca2' in projected:
+        tag = "DCA2 ✓" if projected.get('dca2_filled') else "DCA2"
+        tp_chain += f" → {projected['after_dca2']:.6f} ({tag})"
+    lines.append("🎯 TP Path")
+    lines.append(tp_chain)
+    lines.append("")
+
+    if scheme == 'bullish_long':
+        sl_pct = BULLISH_SL_PCT
+    elif scheme == 'double_sure':
+        sl_pct = DOUBLE_SURE_SL_PCT
+    else:
+        sl_pct = SIDEWAYS_SL_PCT
+    sl_ref = tr.get('sl_reference_price', avg)
+    sl_price = round_price(sym, sl_ref * (1 - sl_pct) if is_long else sl_ref * (1 + sl_pct))
+    sl_sign = "-" if is_long else "+"
+    lines.append(f"🛡 SL: `{sl_price:.6f}` ({sl_sign}{sl_pct*100:.1f}%)")
+    lines.append("")
+
+    lines.append(f"🕯 Wick: Upper {tr.get('upper_wick_pct', 0):.1f}% | Lower {tr.get('lower_wick_pct', 0):.1f}%")
+    lines.append(f"📊 Δ Candle: {tr.get('candle_change_pct', 0):.2f}%  |  Δ 24h: {tr.get('day_change_pct', 0):+.2f}%")
+
+    pattern_type = "Strong Rejection" if tr.get('is_reversal') else "Continuation"
+    lines.append(f"🔍 {tr.get('pattern', 'Pattern')} ({pattern_type})")
+    if tr.get('signal_reason'):
+        lines.append(tr['signal_reason'])
+
+    if is_final and hit_type:
+        lines.append("")
+        lines.append(f"📤 Exit: `{exit_price:.6f}`")
+        lines.append(f"⏱ Duration: {duration}")
+        lines.append("")
+        pnl_icon = "🟢" if (pnl_usdt or 0) >= 0 else "🔴"
+        lines.append(f"💵 PnL: {pnl_pct:+.2f}% (${pnl_usdt:+.2f}) {pnl_icon}")
+
+    return "\n".join(lines)
+
+# === SL MONITOR (TP/DCA1/DCA2 are resting limit orders, watched by order_monitor_loop) ===
+async def sl_monitor_loop():
+    while True:
+        try:
+            async with trade_lock:
+                if not open_trades:
+                    await asyncio.sleep(TP_CHECK_INTERVAL)
+                    continue
+
+                symbols = list(open_trades.keys())
+                tickers = await exchange.fetch_tickers(symbols)
+                prices = {sym: t.get('last') or t.get('close') or t.get('markPrice') for sym, t in tickers.items()}
+
+                for sym in list(open_trades.keys()):
+                    tr = open_trades[sym]
+                    current = prices.get(sym)
+                    if not current: continue
+
+                    is_long = tr['side'] == 'buy'
+                    avg_entry = tr['avg_entry']
+
+                    scheme = tr.get('dca_scheme', 'sideways')
+                    if scheme == 'bullish_long':
+                        sl_pct = BULLISH_SL_PCT
+                    elif scheme == 'double_sure':
+                        sl_pct = DOUBLE_SURE_SL_PCT
+                    else:
+                        sl_pct = SIDEWAYS_SL_PCT
+                    sl_ref = tr.get('sl_reference_price', avg_entry)
+                    sl_price = sl_ref * (1 - sl_pct) if is_long else sl_ref * (1 + sl_pct)
+
+                    if (is_long and current <= sl_price) or (not is_long and current >= sl_price):
+                        await close_trade(sym, "SL", current)
+                        continue
+
+            await asyncio.sleep(TP_CHECK_INTERVAL)
+
+        except Exception as e:
+            logging.error(f"SL monitor loop error: {e}")
+            await asyncio.sleep(1)
+
+# === RESTING LIMIT ORDER HELPERS (DCA1 / DCA2 / TP) ===
+async def safe_fetch_order(sym, order_id):
+    try:
+        return await exchange.fetch_order(order_id, sym)
+    except Exception as e:
+        logging.error(f"fetch_order failed {sym} {order_id}: {e}")
+        return None
+
+async def cancel_order_safe(sym, order_id):
+    if not order_id:
+        return
+    try:
+        await exchange.cancel_order(order_id, sym)
+    except Exception as e:
+        # order may already be filled or cancelled - not fatal
+        logging.warning(f"cancel_order {sym} {order_id}: {e}")
+
+async def place_dca_limit_order(sym, side, capital, price, label):
+    try:
+        amount_raw = (capital * LEVERAGE) / price
+        amount = round_amount(sym, amount_raw)
+        if amount <= 0:
+            return None
+        return await exchange.create_order(sym, 'limit', side, amount, price)
+    except ccxt.InsufficientFunds:
+        await send_telegram(
+            f"⚠️ *{label} LIMIT ORDER NOT PLACED (Insufficient Funds)*\n"
+            f"Symbol: {sym}\nPrice: {price:.6f}\nRequired Margin: ${capital}"
+        )
+        logging.warning(f"Insufficient funds placing {label} for {sym}")
+        return None
+    except Exception as e:
+        logging.error(f"Place {label} order failed {sym}: {e}")
+        return None
+
+async def place_tp_order(sym, side, amount, price):
+    try:
+        amount = round_amount(sym, amount)
+        if amount <= 0:
+            return None
+        return await exchange.create_order(sym, 'limit', side, amount, price, {'reduceOnly': True})
+    except ccxt.InsufficientFunds:
+        await send_telegram(f"⚠️ *TP ORDER NOT PLACED (Insufficient Funds)*\nSymbol: {sym}\nPrice: {price:.6f}")
+        logging.warning(f"Insufficient funds placing TP for {sym}")
+        return None
+    except Exception as e:
+        logging.error(f"Place TP order failed {sym}: {e}")
+        return None
+
+async def handle_dca_filled(sym, tr, order, stage):
+    try:
+        filled_price = round_price(sym, order.get('average') or order.get('price'))
+        filled_amount = order.get('filled') or order.get('amount')
+        scheme = tr.get('dca_scheme', 'sideways')
+        is_double_sure_red = tr.get('is_double_sure_red', False)
+        
+        if scheme == 'bullish_long':
+            capital = BULLISH_DCA1_CAPITAL
+        elif scheme == 'double_sure':
+            if is_double_sure_red:
+                capital = DOUBLE_SURE_RED_DCA1_CAPITAL if stage == 1 else DOUBLE_SURE_RED_DCA2_CAPITAL
+            else:
+                capital = DOUBLE_SURE_GREEN_DCA1_CAPITAL if stage == 1 else DOUBLE_SURE_GREEN_DCA2_CAPITAL
+        else:
+            capital = SIDEWAYS_DCA1_CAPITAL if stage == 1 else SIDEWAYS_DCA2_CAPITAL
+
+        tr['entries'].append({
+            'price': filled_price,
+            'amount': filled_amount,
+            'margin': capital,
+            'ts': time.time(),
+            'stage': stage
+        })
+
+        avg_entry, total_amount = get_avg_entry_and_total(tr)
+        tr['avg_entry'] = avg_entry
+        tr['dca_stage'] = max(tr['dca_stage'], stage)
+        tr[f'dca{stage}_order_id'] = None  # this leg is filled, nothing left to track
+
+        is_long = tr['side'] == 'buy'
+        
+        if scheme == 'bullish_long':
+            tp_pct = BULLISH_TP_AFTER_DCA1_PCT
+        elif scheme == 'double_sure':
+            if is_double_sure_red:
+                tp_pct = DOUBLE_SURE_RED_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_RED_TP_AFTER_DCA2
+            else:
+                tp_pct = DOUBLE_SURE_GREEN_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
+        else:
+            tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if stage == 1 else SIDEWAYS_TP_AFTER_DCA2_PCT
+
+        new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
+        tr['tp'] = new_tp
+
+        # replace the resting TP order to cover the new average / full size
+        await cancel_order_safe(sym, tr.get('tp_order_id'))
+        opposite_side = 'sell' if is_long else 'buy'
+        new_tp_order = await place_tp_order(sym, opposite_side, total_amount, new_tp)
+        tr['tp_order_id'] = new_tp_order['id'] if new_tp_order else None
+
+        save_trades()
+        logging.info(f"DCA{stage} filled on {sym} @ {filled_price} | new avg {avg_entry} | new TP {new_tp}")
+
+        msg_text = build_trade_message(tr, sym)
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+
+    except Exception as e:
+        logging.error(f"DCA{stage} fill handling failed {sym}: {e}")
+
+async def handle_tp_filled(sym, tr, order):
+    try:
+        exit_price = round_price(sym, order.get('average') or order.get('price'))
+        side = tr['side']
+        avg_entry = tr['avg_entry']
+        pnl_pct = (exit_price - avg_entry) / avg_entry * 100 if side == 'buy' else (avg_entry - exit_price) / avg_entry * 100
+        total_margin = sum(e['margin'] for e in tr['entries'])
+        pnl_usdt = total_margin * (pnl_pct / 100) * LEVERAGE
+
+        # cancel any still-resting DCA orders so they don't open a stray position later
+        await cancel_order_safe(sym, tr.get('dca1_order_id'))
+        await cancel_order_safe(sym, tr.get('dca2_order_id'))
+
+        closed = {**tr, 'exit_price': exit_price, 'exit_ts': time.time(), 'hit_type': 'TP',
+                  'pnl_pct': pnl_pct, 'pnl_usdt': pnl_usdt, 'closed_at': get_ist_time().isoformat()}
+        save_closed_trade(closed)
+
+        msg_text = build_trade_message(tr, sym, is_final=True, hit_type='TP', exit_price=exit_price, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+
+        del open_trades[sym]
+        save_trades()
+        logging.info(f"TP filled on {sym} @ {exit_price}")
+
+    except Exception as e:
+        logging.error(f"TP fill handling failed {sym}: {e}")
+
+async def check_trade_orders(sym):
+    """Poll a single trade's resting TP/DCA1/DCA2 orders for fills."""
+    async with trade_lock:
+        tr = open_trades.get(sym)
+        if not tr:
+            return
+
+        tp_id = tr.get('tp_order_id')
+        if tp_id:
+            order = await safe_fetch_order(sym, tp_id)
+            if order and order.get('status') == 'closed':
+                await handle_tp_filled(sym, tr, order)
+                return  # trade is closed, nothing else to check
+
+        dca1_id = tr.get('dca1_order_id')
+        if dca1_id:
+            order = await safe_fetch_order(sym, dca1_id)
+            if order and order.get('status') == 'closed':
+                await handle_dca_filled(sym, tr, order, stage=1)
+
+        dca2_id = tr.get('dca2_order_id')
+        if dca2_id:
+            order = await safe_fetch_order(sym, dca2_id)
+            if order and order.get('status') == 'closed':
+                await handle_dca_filled(sym, tr, order, stage=2)
+
+async def order_monitor_loop():
+    """Watches resting DCA1/DCA2/TP limit orders and reacts to fills."""
+    while True:
+        try:
+            syms = list(open_trades.keys())
+            for sym in syms:
+                await check_trade_orders(sym)
+            await asyncio.sleep(ORDER_CHECK_INTERVAL)
+        except Exception as e:
+            logging.error(f"Order monitor loop error: {e}")
+            await asyncio.sleep(ORDER_CHECK_INTERVAL)
+
+async def close_trade(sym, hit_type, exit_price):
+    try:
+        tr = open_trades[sym]
+        side = tr['side']
+        close_side = 'sell' if side == 'buy' else 'buy'
+        total_amount = sum(e['amount'] for e in tr['entries'])
+
+        # cancel any resting TP/DCA orders first so nothing is left orphaned
+        await cancel_order_safe(sym, tr.get('tp_order_id'))
+        await cancel_order_safe(sym, tr.get('dca1_order_id'))
+        await cancel_order_safe(sym, tr.get('dca2_order_id'))
+
+        close_order = await exchange.create_market_order(sym, close_side, total_amount)
+        filled_exit = round_price(sym, close_order.get('average') or exit_price)
+
+        avg_entry = tr['avg_entry']
+        pnl_pct = (filled_exit - avg_entry) / avg_entry * 100 if side == 'buy' else (avg_entry - filled_exit) / avg_entry * 100
+        total_margin = sum(e['margin'] for e in tr['entries'])
+        pnl_usdt = total_margin * (pnl_pct / 100) * LEVERAGE
+
+        closed = {**tr, 'exit_price': filled_exit, 'exit_ts': time.time(), 'hit_type': hit_type,
+                  'pnl_pct': pnl_pct, 'pnl_usdt': pnl_usdt, 'closed_at': get_ist_time().isoformat()}
+
+        save_closed_trade(closed)
+
+        msg_text = build_trade_message(tr, sym, is_final=True, hit_type=hit_type, exit_price=filled_exit, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+        if tr.get('msg_id_initial'):
+            await edit_telegram_message(tr['msg_id_initial'], msg_text)
+
+        del open_trades[sym]
+        save_trades()
+
+    except Exception as e:
+        logging.error(f"Close trade failed {sym}: {e}")
+
+
+async def update_eth_trend():
+
+    global eth_trend
+    global eth_last_candle
+    global eth_market_phases
+    global eth_phase_text
+    global eth_ema9
+    global eth_ema21
+    global eth_ema_gap
+
+    try:
+
+        candles = await exchange.fetch_ohlcv(
+            "ETH/USDT:USDT",
+            "1h",
+            limit=50
+        )
+
+        candles = candles[:-1]
+
+        if candles[-1][0] == eth_last_candle:
+            return
+
+        eth_last_candle = candles[-1][0]
+
+        closes = [c[4] for c in candles]
+
+        phase_history = []
+
+        for i in range(21, len(closes)):
+
+            price = closes[:i + 1]
+
+            ema9 = calculate_ema(price, 9)
+            ema21 = calculate_ema(price, 21)
+
+            ema9_prev = calculate_ema(price[:-1], 9)
+            ema21_prev = calculate_ema(price[:-1], 21)
+
+            gap = abs(ema9 - ema21)
+            gap_prev = abs(ema9_prev - ema21_prev)
+
+            ema9_dir = "UP" if ema9 > ema9_prev else "DOWN"
+            ema21_dir = "UP" if ema21 > ema21_prev else "DOWN"
+            gap_dir = "UP" if gap > gap_prev else "DOWN"
+
+            diff_pct = gap / ema21 * 100
+
+            if ema9 > ema21 and diff_pct >= 0.30:
+                direction = "BULLISH"
+
+            elif ema9 < ema21 and diff_pct >= 0.30:
+                direction = "BEARISH"
+
+            else:
+                direction = "SIDEWAYS"
+
+            phase = phase_name(
+                direction,
+                ema9_dir,
+                ema21_dir,
+                gap_dir
+            )
+
+            phase_history.append({
+                "time": candles[i][0],
+                "phase": phase
+            })
+
+        eth_market_phases = []
+
+        start_time = phase_history[0]["time"]
+        current_phase = phase_history[0]["phase"]
+
+        for p in phase_history[1:]:
+
+            if p["phase"] != current_phase:
+
+                eth_market_phases.append({
+                    "start": start_time,
+                    "end": p["time"],
+                    "phase": current_phase
+                })
+
+                start_time = p["time"]
+                current_phase = p["phase"]
+
+        eth_market_phases.append({
+            "start": start_time,
+            "end": phase_history[-1]["time"],
+            "phase": current_phase
+        })
+        latest = eth_market_phases[-1]["phase"]
+
+        # ==========================
+        # Save latest EMA values
+        # ==========================
+        eth_ema9 = calculate_ema(closes, 9)
+        eth_ema21 = calculate_ema(closes, 21)
+        eth_ema_gap = abs(eth_ema9 - eth_ema21) / eth_ema21 * 100
+
+        if latest == "🔴 Bearish Momentum Building":
+            eth_phase = "BEARISH_MOMENTUM"
+
+        elif latest == "🟠 Bearish Momentum Fading":
+            eth_phase = "BEARISH_FADING"
+
+        elif latest == "⚪ Sideways (Bullish Bias)":
+            eth_phase = "SIDEWAYS_BULLISH"
+
+        elif latest == "⚪ Sideways (Bearish Bias)":
+            eth_phase = "SIDEWAYS_BEARISH"
+
+        elif latest == "🟢 Bullish Momentum Building":
+            eth_phase = "BULLISH_MOMENTUM"
+
+        elif latest == "🟡 Bullish Momentum Fading":
+            eth_phase = "BULLISH_FADING"
+
+        elif latest == "⚪ Transition / Indecision":
+            eth_phase = "TRANSITION"
+
+        else:
+            eth_phase = "INDECISION"
+
+        if "Bullish" in latest:
+            eth_trend = "BULLISH"
+
+        elif "Bearish" in latest:
+            eth_trend = "BEARISH"
+
+        else:
+            eth_trend = "SIDEWAYS"
+
+        next_phase, confidence = predict_next_phase(latest)
+
+        text = (
+    f"📊 ETH FILTER\n"
+    f"Trend: {eth_trend}\n"
+    f"EMA9: {eth_ema9:.2f}\n"
+    f"EMA21: {eth_ema21:.2f}\n"
+    f"EMA Gap: {eth_ema_gap:.2f}%\n\n"
+)
+        text += "📊 ETH MARKET PHASE (Last Hours)\n\n"
+
+        for p in eth_market_phases[-4:]:
+            s = datetime.fromtimestamp(
+                p["start"] / 1000,
+                pytz.timezone("Asia/Kolkata")
+            ).strftime("%H:%M")
+
+            e = datetime.fromtimestamp(
+                p["end"] / 1000,
+                pytz.timezone("Asia/Kolkata")
+            ).strftime("%H:%M")
+
+            text += (
+                f"{s} → {e}\n"
+                f"{p['phase']}\n\n"
+            )
+
+        text += (
+            f"➡️ Next Expected Phase\n"
+            f"{next_phase}\n"
+            f"Confidence: {confidence}"
+        )
+
+        eth_phase_text = text
+
+        await send_telegram(text)
+
+    except Exception as e:
+        logging.error(f"ETH trend error: {e}")
+
+async def eth_filter_loop():
+    while True:
+        try:
+            await update_eth_trend()
+            await asyncio.sleep(60)
+        except Exception as e:
+            logging.error(f"ETH loop error: {e}")
+            await asyncio.sleep(60)
+
+# === PROCESS SYMBOL WITH INSUFFICIENT HANDLING ===
+async def process_symbol(symbol, timeframe):
+    side = None
+    is_reversal = False
+    pattern = None
+    big_open = None
+    entry_price = None
+    candle_change_pct = 0.0
+    day_change_pct = 0.0
+    is_danger = False
+    is_caution = False
+    is_double_sure = False
+    is_double_sure_red = False
+    upper_w = 0.0
+    lower_w = 0.0
+    try:
+        candles = await exchange.fetch_ohlcv(symbol, timeframe, limit=CANDLE_LIMIT)
+        if len(candles) < 9: return
+
+        signal_time = candles[-2][0]
+        key = (symbol, timeframe, 'pattern')
+
+        async with trade_lock:
+            if len(open_trades) >= MAX_OPEN_TRADES: return
+            if sent_signals.get(key) == signal_time: return
+
+            sent_signals[key] = signal_time
+
+        is_rising, big_candle = detect_rising_three(candles)
+        is_falling, big_candle_f = detect_falling_three(candles)
+
+        if is_rising:
+            pattern = 'Rising Three'
+            side, signal_msg, is_reversal = get_wick_signal(big_candle)
+            big_open = big_candle[1]
+            candle_change_pct = body_pct(big_candle)
+            upper_w = upper_wick_pct(big_candle)
+            lower_w = lower_wick_pct(big_candle)
+        elif is_falling:
+            pattern = 'Falling Three'
+            side, signal_msg, is_reversal = get_wick_signal(big_candle_f)
+            big_open = big_candle_f[1]
+            candle_change_pct = body_pct(big_candle_f)
+            upper_w = upper_wick_pct(big_candle_f)
+            lower_w = lower_wick_pct(big_candle_f)
+        else:
+            return
+
+        if not side:
+            return
+
+        # ==========================
+        # DOUBLE SURE BET (overrides trend filter + side)
+        # ==========================
+        # Either both wicks blow past DOUBLE_SURE_WICK_PCT of the body, or the
+        # big candle's own body is bigger than DOUBLE_SURE_BIG_CANDLE_PCT —
+        # side depends on candle color: RED → BUY, GREEN → SELL
+        is_double_sure = (
+            (upper_w > DOUBLE_SURE_WICK_PCT and lower_w > DOUBLE_SURE_WICK_PCT)
+            or abs(candle_change_pct) > DOUBLE_SURE_BIG_CANDLE_PCT
+        )
+        if is_double_sure:
+            # Detect which big candle we're looking at
+            big_candle_to_check = big_candle if is_rising else big_candle_f
+            
+            if is_bearish(big_candle_to_check):  # RED candle
+                side = 'buy'
+                is_double_sure_red = True
+                signal_msg = (
+                    f"Double Sure Bet | Upper:{upper_w:.1f}% Lower:{lower_w:.1f}% "
+                    f"Body:{candle_change_pct:.2f}% → BUY (Red Rejection)"
+                )
+            else:  # GREEN candle
+                side = 'sell'
+                is_double_sure_red = False
+                signal_msg = (
+                    f"Double Sure Bet | Upper:{upper_w:.1f}% Lower:{lower_w:.1f}% "
+                    f"Body:{candle_change_pct:.2f}% → SELL (Green Rejection)"
+                )
+            is_reversal = True
+
+# ==========================
+# ETH FILTER (bypassed entirely for a Double Sure Bet)
+# ==========================
+        if is_double_sure:
+            pass
+
+        elif eth_trend == "BULLISH":
+
+            # Rising continuation
+            if pattern == "Rising Three" and not is_reversal:
+                pass
+
+            elif pattern == "Rising Three" and is_reversal:
+                pass
+
+            else:
+                logging.info(f"{symbol} rejected - Bullish")
+                return
+
+        elif eth_trend == "SIDEWAYS":
+
+            if pattern == "Rising Three" and not is_reversal:
+                side = "sell"
+            else:
+                logging.info(f"{symbol} rejected - Sideways")
+                return
+
+        elif eth_trend == "BEARISH":
+
+            logging.info(f"{symbol} rejected - Bearish")
+            return
+
+        await prepare_symbol(symbol)
+
+        # 24h % change for this symbol (used for the danger/caution flag)
+        try:
+            ticker = await exchange.fetch_ticker(symbol)
+            day_change_pct = ticker.get('percentage') or 0.0
+        except Exception as e:
+            logging.warning(f"fetch_ticker failed for {symbol}: {e}")
+            day_change_pct = 0.0
+
+        is_danger = abs(candle_change_pct) > CANDLE_FLAG_PCT and abs(day_change_pct) > DAY_DANGER_PCT
+        is_caution = abs(candle_change_pct) > CANDLE_FLAG_PCT and not is_danger
+
+        # Reuse the just-closed signal candle's close instead of an extra fetch_ticker
+        # round-trip - cuts latency between signal detection and order placement.
+        entry_price = round_price(symbol, candles[-2][4])
+
+        initial_capital = DOUBLE_SURE_CAPITAL if is_double_sure else CAPITAL_INITIAL
+        amount_raw = (initial_capital * LEVERAGE) / entry_price
+        amount = round_amount(symbol, amount_raw)
+        if amount <= 0: return
+
+        entry_order = await exchange.create_market_order(symbol, side, amount)
+        filled_price = round_price(symbol, entry_order.get('average') or entry_price)
+
+        dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
+            symbol, eth_trend, side, is_reversal, big_open, filled_price, is_double_sure, is_double_sure_red
+        )
+
+        # Place DCA1 (and DCA2, if this scheme has one) as resting limit orders
+        if dca_scheme == 'double_sure':
+            dca1_capital = DOUBLE_SURE_RED_DCA1_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA1_CAPITAL
+        elif dca_scheme == 'bullish_long':
+            dca1_capital = BULLISH_DCA1_CAPITAL
+        else:
+            dca1_capital = SIDEWAYS_DCA1_CAPITAL
+            
+        dca1_order = await place_dca_limit_order(symbol, side, dca1_capital, dca1_level, 'DCA1')
+
+        dca2_order = None
+        if dca2_level is not None:
+            if dca_scheme == 'double_sure':
+                dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
+            else:
+                dca2_capital = SIDEWAYS_DCA2_CAPITAL
+            dca2_order = await place_dca_limit_order(symbol, side, dca2_capital, dca2_level, 'DCA2')
+
+        opposite_side = 'sell' if side == 'buy' else 'buy'
+        tp_order = await place_tp_order(symbol, opposite_side, amount, tp)
+
+        initial_trade = {
+            'side': side,
+            'initial_price': filled_price,
+            'entries': [{
+                'price': filled_price,
+                'amount': amount,
+                'margin': initial_capital,
+                'ts': time.time(),
+                'stage': 0
+            }],
+            'avg_entry': filled_price,
+            'tp': tp,
+            'tp_initial': tp,  # immutable snapshot of the original TP — never overwritten
+            'dca_stage': 0,
+
+            'msg_id_initial': None,
+            'open_ts': time.time(),
+            'timeframe': timeframe,
+            'signal_reason': signal_msg,
+            'pattern': pattern,
+            'is_reversal': is_reversal,
+            'dca_scheme': dca_scheme,
+            'sl_reference_price': sl_reference_price,
+            'dca1_level': dca1_level,
+            'dca2_level': dca2_level,  # None for bullish_long scheme
+            'tp_order_id': tp_order['id'] if tp_order else None,
+            'dca1_order_id': dca1_order['id'] if dca1_order else None,
+            'dca2_order_id': dca2_order['id'] if dca2_order else None,
+            'candle_change_pct': candle_change_pct,
+            'day_change_pct': day_change_pct,
+            'is_danger': is_danger,
+            'is_caution': is_caution,
+            'is_double_sure': is_double_sure,
+            'is_double_sure_red': is_double_sure_red,
+            'upper_wick_pct': upper_w,
+            'lower_wick_pct': lower_w,
+        }
+
+        msg_text = build_trade_message(initial_trade, symbol)
+        mid = await send_telegram(msg_text)
+        initial_trade['msg_id_initial'] = mid
+
+        async with trade_lock:
+            open_trades[symbol] = initial_trade
+            await asyncio.to_thread(save_trades)
+
+        logging.info(f"Opened {side.upper()} {symbol} | {pattern} {'- Strong Reversal' if is_reversal else '- Continuation'} | scheme={dca_scheme}")
+
+    except ccxt.InsufficientFunds:
+
+        dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
+            symbol, eth_trend, side, is_reversal, big_open, entry_price, is_double_sure, is_double_sure_red
+        )
+
+        required_margin = DOUBLE_SURE_CAPITAL if is_double_sure else CAPITAL_INITIAL
+
+        # Build a minimal trade-shaped dict (no entries actually filled) so we
+        # can reuse compute_projected_tps for the "TP after DCA1/DCA2" chain,
+        # same as a live trade message shows.
+        planned_amount = locals().get('amount') or round_amount(symbol, (required_margin * LEVERAGE) / entry_price)
+        temp_tr = {
+            'side': side,
+            'entries': [{'price': entry_price, 'amount': planned_amount, 'stage': 0}],
+            'tp': tp,
+            'tp_initial': tp,
+            'dca_stage': 0,
+            'dca_scheme': dca_scheme,
+            'dca1_level': dca1_level,
+            'dca2_level': dca2_level,
+            'is_double_sure_red': is_double_sure_red,
+        }
+        projected = compute_projected_tps(symbol, temp_tr)
+
+        tp_chain = f"{entry_price:.6f} → {projected['initial']:.6f}"
+        if 'after_dca1' in projected:
+            tp_chain += f" → {projected['after_dca1']:.6f} (DCA1)"
+        if 'after_dca2' in projected:
+            tp_chain += f" → {projected['after_dca2']:.6f} (DCA2)"
+
+        dca2_str = f"{dca2_level:.6f}" if dca2_level is not None else "N/A (no DCA2)"
+
+        flag = ""
+        if is_double_sure:
+            flag += "🎯 DOUBLE SURE BET\n"
+        if is_danger:
+            flag += "⚡ HIGH VOLATILITY\n"
+        elif is_caution:
+            flag += "🔸 SHARP MOVE\n"
+
+        await send_telegram(
+            f"{flag}"
+            f"⚠️ *INSUFFICIENT FUNDS*\n\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side.upper()}\n"
+            f"Pattern: {pattern}\n\n"
+            f"Entry: {entry_price:.6f}\n"
+            f"🧩 DCA Orders: DCA1: {dca1_level:.6f} | DCA2: {dca2_str}\n\n"
+            f"🎯 TP Path\n"
+            f"{tp_chain}\n\n"
+            f"🕯 Wick: Upper {upper_w:.1f}% | Lower {lower_w:.1f}%\n"
+            f"Δ Candle: {candle_change_pct:.2f}% | Δ 24h: {day_change_pct:+.2f}%\n"
+            f"Required Margin: ${required_margin:g}"
+        )
+
+        logging.warning(
+            f"Insufficient funds for initial trade on {symbol}"
+        )
+
+    except Exception as e:
+        logging.error(f"Trade failed {symbol}: {e}")
+
+# === SCANNING ===
+async def process_batch(symbols_chunk, timeframe):
+    tasks = [asyncio.create_task(process_symbol(s, timeframe)) for s in symbols_chunk]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+async def scan_loop(symbols):
+    while True:
+        wait_until = get_next_candle_close()
+        sleep_sec = max(0, wait_until - time.time())
+        logging.info(f"Next scan in ~{sleep_sec//60} min")
+        await asyncio.sleep(sleep_sec)
+
+        for tf in TIMEFRAMES:
+            logging.info(f"Scanning {tf}")
+            chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
+            chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
+            for i, chunk in enumerate(chunks):
+                await process_batch(chunk, tf)
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(BATCH_DELAY)
+        logging.info("Full scan completed")
+
+def get_next_candle_close():
+    now = get_ist_time()
+    secs = now.minute * 60 + now.second
+    secs_to = (5 * 60) - (secs % (5 * 60))
+    if secs_to < 30:
+        secs_to += 5 * 60
+    return time.time() + secs_to
+
+async def daily_summary():
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            closed = []
+            if os.path.exists(CLOSED_TRADE_FILE):
+                with open(CLOSED_TRADE_FILE) as f:
+                    closed = json.load(f)
+            total_pnl = sum(t.get('pnl_usdt', 0) for t in closed)
+            bal = await exchange.fetch_balance()
+            usdt = bal.get('USDT', {})
+            total = usdt.get('free', 0) + usdt.get('total', 0)
+            msg = f"📊 *Daily Summary*\nTotal PnL: ${total_pnl:.2f}\nOpen: {len(open_trades)}\nBalance: ${total:.2f}"
+            await send_telegram(msg)
+        except Exception as e:
+            logging.error(f"Daily summary error: {e}")
+
+async def main():
+    global exchange
+    exchange = await initialize_exchange()
+    markets = exchange.markets
+    symbols = get_symbols(markets)
+    load_trades()
+    await update_eth_trend()
+
+    logging.info(f"Starting bot with {len(symbols)} symbols")
+
+    startup_msg = f"🚀 **Bot Restarted** @ {get_ist_time().strftime('%Y-%m-%d %H:%M IST')}\nPatterns + Wick Filter | SL: trend-based | Insufficient Warning Active"
+    await send_telegram(startup_msg)
+
+    tasks = [
+    asyncio.create_task(scan_loop(symbols)),
+    asyncio.create_task(sl_monitor_loop()),
+    asyncio.create_task(order_monitor_loop()),
+    asyncio.create_task(daily_summary()),
+    asyncio.create_task(eth_filter_loop()),
+]
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    asyncio.run(main())

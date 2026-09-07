@@ -51,7 +51,7 @@ SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 # Side depends on candle color: RED candle → BUY, GREEN candle → SELL
 DOUBLE_SURE_WICK_PCT = 10.0            # both wicks must exceed this % of body
 DOUBLE_SURE_BIG_CANDLE_PCT = 3.0       # OR: big-candle body % this large
-DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin
+DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin (GREEN/SELL case)
 DOUBLE_SURE_SL_PCT = 8.0 / 100          # fixed, off entry price
 
 # --- GREEN Candle (SELL) - Decreasing TP as positions add ---
@@ -64,8 +64,9 @@ DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
 DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
 
 # --- RED Candle (BUY) - Different structure ---
+DOUBLE_SURE_RED_INITIAL_CAPITAL = 40.0   # initial entry margin for RED/BUY case
 DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
-DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 0.5 / 100
+DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 1.0 / 100
 DOUBLE_SURE_RED_DCA1_CAPITAL = 20.0
 DOUBLE_SURE_RED_TP_AFTER_DCA1 = 2.0 / 100
 DOUBLE_SURE_RED_DCA2_TRIGGER_PCT = 3.0 / 100
@@ -537,7 +538,7 @@ def build_eth_sync_reject_message(symbol, side, pattern, last3, conflicts):
     return "\n".join(lines)
 
 # === TREND-BASED TRADE PLAN ===
-def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False):
+def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False, pattern=None, big_high=None):
     """
     Decides which DCA/TP/SL scheme a trade uses, and computes the initial
     levels for it.
@@ -547,7 +548,9 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 
     Three schemes:
       - 'double_sure': the double-wick / big-candle override SHORT/BUY.
-        Color-dependent TP structure.
+        Color-dependent TP structure. For the RED-candle (BUY) case on a
+        Falling Three pattern, the initial TP1 is the big candle's high
+        price instead of a fixed percentage.
       - 'bullish_long': ETH-bullish trend, continuation LONG (Rising Three,
         non-reversal, buy side) only.
       - 'sideways': everything else that reaches this point.
@@ -584,7 +587,14 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
         dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
         sl_reference_price = ref_price
 
-    tp = round_price(symbol, ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct))
+    # Special case: Double Sure BET, RED candle (BUY), Falling Three pattern
+    # -> TP1 is the big candle's high price instead of a fixed % target.
+    if is_double_sure and is_double_sure_red and pattern == 'Falling Three' and big_high is not None:
+        tp = big_high
+    else:
+        tp = ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct)
+
+    tp = round_price(symbol, tp)
     dca1_level = round_price(symbol, dca1_level)
     dca2_level = round_price(symbol, dca2_level) if dca2_level is not None else None
     sl_reference_price = round_price(symbol, sl_reference_price)
@@ -1234,6 +1244,7 @@ async def process_symbol(symbol, timeframe):
     is_reversal = False
     pattern = None
     big_open = None
+    big_high = None
     entry_price = None
     candle_change_pct = 0.0
     day_change_pct = 0.0
@@ -1263,6 +1274,7 @@ async def process_symbol(symbol, timeframe):
             pattern = 'Rising Three'
             side, signal_msg, is_reversal = get_wick_signal(big_candle)
             big_open = big_candle[1]
+            big_high = big_candle[2]
             candle_change_pct = body_pct(big_candle)
             upper_w = upper_wick_pct(big_candle)
             lower_w = lower_wick_pct(big_candle)
@@ -1270,6 +1282,7 @@ async def process_symbol(symbol, timeframe):
             pattern = 'Falling Three'
             side, signal_msg, is_reversal = get_wick_signal(big_candle_f)
             big_open = big_candle_f[1]
+            big_high = big_candle_f[2]
             candle_change_pct = body_pct(big_candle_f)
             upper_w = upper_wick_pct(big_candle_f)
             lower_w = lower_wick_pct(big_candle_f)
@@ -1372,7 +1385,9 @@ async def process_symbol(symbol, timeframe):
         # round-trip - cuts latency between signal detection and order placement.
         entry_price = round_price(symbol, candles[-2][4])
 
-        initial_capital = DOUBLE_SURE_CAPITAL if is_double_sure else CAPITAL_INITIAL
+        initial_capital = CAPITAL_INITIAL
+        if is_double_sure:
+            initial_capital = DOUBLE_SURE_RED_INITIAL_CAPITAL if is_double_sure_red else DOUBLE_SURE_CAPITAL
         amount_raw = (initial_capital * LEVERAGE) / entry_price
         amount = round_amount(symbol, amount_raw)
         if amount <= 0: return
@@ -1381,7 +1396,8 @@ async def process_symbol(symbol, timeframe):
         filled_price = round_price(symbol, entry_order.get('average') or entry_price)
 
         dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
-            symbol, eth_trend, side, is_reversal, big_open, filled_price, is_double_sure, is_double_sure_red
+            symbol, eth_trend, side, is_reversal, big_open, filled_price, is_double_sure, is_double_sure_red,
+            pattern=pattern, big_high=big_high
         )
 
         # Place DCA1 (and DCA2, if this scheme has one) as resting limit orders
@@ -1456,10 +1472,13 @@ async def process_symbol(symbol, timeframe):
     except ccxt.InsufficientFunds:
 
         dca_scheme, tp, dca1_level, dca2_level, sl_reference_price = compute_trade_plan(
-            symbol, eth_trend, side, is_reversal, big_open, entry_price, is_double_sure, is_double_sure_red
+            symbol, eth_trend, side, is_reversal, big_open, entry_price, is_double_sure, is_double_sure_red,
+            pattern=pattern, big_high=big_high
         )
 
-        required_margin = DOUBLE_SURE_CAPITAL if is_double_sure else CAPITAL_INITIAL
+        required_margin = CAPITAL_INITIAL
+        if is_double_sure:
+            required_margin = DOUBLE_SURE_RED_INITIAL_CAPITAL if is_double_sure_red else DOUBLE_SURE_CAPITAL
 
         # Build a minimal trade-shaped dict (no entries actually filled) so we
         # can reuse compute_projected_tps for the "TP after DCA1/DCA2" chain,

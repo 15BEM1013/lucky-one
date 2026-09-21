@@ -49,9 +49,10 @@ SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 # Triggered when the big candle's upper AND lower wick are both >10% of its
 # body, OR the big candle's body is itself >3% (a huge-range candle).
 # Side depends on candle color: RED candle → BUY, GREEN candle → SELL
+DOUBLE_SURE_ONLY = True                # True = trade ONLY Double Sure setups, skip everything else
 DOUBLE_SURE_WICK_PCT = 10.0            # both wicks must exceed this % of body
 DOUBLE_SURE_BIG_CANDLE_PCT = 3.0       # OR: big-candle body % this large
-DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin (GREEN/SELL case)
+DOUBLE_SURE_CAPITAL = 40.0             # initial entry margin (GREEN/SELL case)
 DOUBLE_SURE_SL_PCT = 8.0 / 100          # fixed, off entry price
 
 # --- GREEN Candle (SELL) - Decreasing TP as positions add ---
@@ -59,7 +60,7 @@ DOUBLE_SURE_GREEN_TP_INITIAL = 1.0 / 100
 DOUBLE_SURE_GREEN_TP_AFTER_DCA1 = 0.8 / 100
 DOUBLE_SURE_GREEN_TP_AFTER_DCA2 = 0.6 / 100
 DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT = 1.5 / 100
-DOUBLE_SURE_GREEN_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_GREEN_DCA1_CAPITAL = 80.0
 DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
 DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
 
@@ -67,7 +68,7 @@ DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
 DOUBLE_SURE_RED_INITIAL_CAPITAL = 40.0   # initial entry margin for RED/BUY case
 DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
 DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 1.0 / 100
-DOUBLE_SURE_RED_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_RED_DCA1_CAPITAL = 80.0
 DOUBLE_SURE_RED_TP_AFTER_DCA1 = 2.0 / 100
 DOUBLE_SURE_RED_DCA2_TRIGGER_PCT = 3.0 / 100
 DOUBLE_SURE_RED_DCA2_CAPITAL = 10.0
@@ -1289,8 +1290,10 @@ async def process_symbol(symbol, timeframe):
         else:
             return
 
-        if not side:
-            return
+        # NOTE: the old `if not side: return` was removed from here on purpose.
+        # get_wick_signal() returns None for some red candles (lower wick >30%),
+        # which would have dropped valid Double Sure setups before they were
+        # evaluated. The gate below now handles the "no side" case instead.
 
         # ==========================
         # DOUBLE SURE BET (overrides trend filter + side)
@@ -1302,6 +1305,12 @@ async def process_symbol(symbol, timeframe):
             (upper_w > DOUBLE_SURE_WICK_PCT and lower_w > DOUBLE_SURE_WICK_PCT)
             or abs(candle_change_pct) > DOUBLE_SURE_BIG_CANDLE_PCT
         )
+
+        # Double-Sure-only mode: skip everything that isn't a Double Sure setup.
+        # (If the mode is off, non-Double-Sure signals still need a valid side.)
+        if not is_double_sure and (DOUBLE_SURE_ONLY or not side):
+            return
+
         if is_double_sure:
             # Detect which big candle we're looking at
             big_candle_to_check = big_candle if is_rising else big_candle_f

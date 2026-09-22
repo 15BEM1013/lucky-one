@@ -25,22 +25,23 @@ BATCH_DELAY = 2.0
 NUM_CHUNKS = 8
 
 # TRADE SETTINGS
-CAPITAL_INITIAL = 10.0
 LEVERAGE = 9
 
 # --- Bullish-trend continuation LONG scheme ---
+BULLISH_INITIAL_CAPITAL = 30.0
 BULLISH_DCA1_TRIGGER_PCT = 0.2 / 100   # big-candle open + 0.2%
-BULLISH_DCA1_CAPITAL = 20.0
+BULLISH_DCA1_CAPITAL = 60.0
 BULLISH_TP_AFTER_DCA1_PCT = 0.8 / 100  # from new avg entry
 BULLISH_SL_PCT = 3.5 / 100             # fixed, off big-candle open price
 BULLISH_TP_INITIAL_PCT = 1.0 / 100     # unchanged, no-DCA case
 
 # --- Sideways-trend SHORT scheme (also used for bullish-reversal SHORTs) ---
+SIDEWAYS_INITIAL_CAPITAL = 20.0
 SIDEWAYS_DCA1_TRIGGER_PCT = 1.0 / 100  # from entry price
-SIDEWAYS_DCA1_CAPITAL = 20.0
+SIDEWAYS_DCA1_CAPITAL = 40.0
 SIDEWAYS_TP_AFTER_DCA1_PCT = 0.8 / 100
 SIDEWAYS_DCA2_TRIGGER_PCT = 3.0 / 100  # from entry price (not from DCA1)
-SIDEWAYS_DCA2_CAPITAL = 10.0
+SIDEWAYS_DCA2_CAPITAL = 20.0
 SIDEWAYS_TP_AFTER_DCA2_PCT = 0.6 / 100
 SIDEWAYS_SL_PCT = 5.0 / 100            # fixed, off entry price
 SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
@@ -51,7 +52,7 @@ SIDEWAYS_TP_INITIAL_PCT = 0.8 / 100    # no-DCA case
 # Side depends on candle color: RED candle → BUY, GREEN candle → SELL
 DOUBLE_SURE_WICK_PCT = 10.0            # both wicks must exceed this % of body
 DOUBLE_SURE_BIG_CANDLE_PCT = 3.0       # OR: big-candle body % this large
-DOUBLE_SURE_CAPITAL = 20.0             # initial entry margin (GREEN/SELL case)
+DOUBLE_SURE_CAPITAL = 30.0             # initial entry margin (GREEN/SELL case)
 DOUBLE_SURE_SL_PCT = 8.0 / 100          # fixed, off entry price
 
 # --- GREEN Candle (SELL) - Decreasing TP as positions add ---
@@ -59,18 +60,18 @@ DOUBLE_SURE_GREEN_TP_INITIAL = 1.0 / 100
 DOUBLE_SURE_GREEN_TP_AFTER_DCA1 = 0.8 / 100
 DOUBLE_SURE_GREEN_TP_AFTER_DCA2 = 0.6 / 100
 DOUBLE_SURE_GREEN_DCA1_TRIGGER_PCT = 1.5 / 100
-DOUBLE_SURE_GREEN_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_GREEN_DCA1_CAPITAL = 60.0
 DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
-DOUBLE_SURE_GREEN_DCA2_CAPITAL = 10.0
+DOUBLE_SURE_GREEN_DCA2_CAPITAL = 20.0
 
 # --- RED Candle (BUY) - Different structure ---
 DOUBLE_SURE_RED_INITIAL_CAPITAL = 40.0   # initial entry margin for RED/BUY case
 DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
 DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 1.0 / 100
-DOUBLE_SURE_RED_DCA1_CAPITAL = 20.0
+DOUBLE_SURE_RED_DCA1_CAPITAL = 40.0
 DOUBLE_SURE_RED_TP_AFTER_DCA1 = 2.0 / 100
 DOUBLE_SURE_RED_DCA2_TRIGGER_PCT = 3.0 / 100
-DOUBLE_SURE_RED_DCA2_CAPITAL = 10.0
+DOUBLE_SURE_RED_DCA2_CAPITAL = 80.0
 DOUBLE_SURE_RED_TP_AFTER_DCA2 = 1.5 / 100
 
 # --- Volatility flag thresholds ---
@@ -538,9 +539,21 @@ def build_eth_sync_reject_message(symbol, side, pattern, last3, conflicts):
     return "\n".join(lines)
 
 # === TREND-BASED TRADE PLAN ===
+def determine_scheme(eth_trend_now, is_long, is_reversal, is_double_sure):
+    """
+    Single source of truth for which capital/DCA/TP scheme a signal uses.
+    Used both to pick the initial entry margin (before the order is placed)
+    and inside compute_trade_plan (for DCA/TP levels).
+    """
+    if is_double_sure:
+        return 'double_sure'
+    if eth_trend_now == "BULLISH" and is_long and not is_reversal:
+        return 'bullish_long'
+    return 'sideways'
+
 def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_price, is_double_sure=False, is_double_sure_red=False, pattern=None, big_high=None):
     """
-    Decides which DCA/TP/SL scheme a trade uses, and computes the initial
+    Decides which DCA/TP scheme a trade uses, and computes the initial
     levels for it.
 
     ref_price = filled_price (order succeeded) or last known ticker/entry
@@ -559,10 +572,9 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
     All price values are rounded to the symbol's tick size.
     """
     is_long = side == 'buy'
-    use_bullish_long_scheme = (eth_trend_now == "BULLISH" and is_long and not is_reversal)
+    dca_scheme = determine_scheme(eth_trend_now, is_long, is_reversal, is_double_sure)
 
-    if is_double_sure:
-        dca_scheme = 'double_sure'
+    if dca_scheme == 'double_sure':
 
         if is_double_sure_red:  # RED candle BUY
             tp_pct = DOUBLE_SURE_RED_TP_INITIAL
@@ -574,14 +586,12 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
             dca2_level = ref_price * (1 + DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT)
 
         sl_reference_price = ref_price
-    elif use_bullish_long_scheme:
-        dca_scheme = 'bullish_long'
+    elif dca_scheme == 'bullish_long':
         tp_pct = BULLISH_TP_INITIAL_PCT
         dca1_level = big_open * (1 + BULLISH_DCA1_TRIGGER_PCT)
         dca2_level = None
         sl_reference_price = big_open
     else:
-        dca_scheme = 'sideways'
         tp_pct = SIDEWAYS_TP_INITIAL_PCT
         dca1_level = ref_price * (1 - SIDEWAYS_DCA1_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA1_TRIGGER_PCT)
         dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
@@ -1385,9 +1395,13 @@ async def process_symbol(symbol, timeframe):
         # round-trip - cuts latency between signal detection and order placement.
         entry_price = round_price(symbol, candles[-2][4])
 
-        initial_capital = CAPITAL_INITIAL
-        if is_double_sure:
+        scheme_for_capital = determine_scheme(eth_trend, side == 'buy', is_reversal, is_double_sure)
+        if scheme_for_capital == 'double_sure':
             initial_capital = DOUBLE_SURE_RED_INITIAL_CAPITAL if is_double_sure_red else DOUBLE_SURE_CAPITAL
+        elif scheme_for_capital == 'bullish_long':
+            initial_capital = BULLISH_INITIAL_CAPITAL
+        else:
+            initial_capital = SIDEWAYS_INITIAL_CAPITAL
         amount_raw = (initial_capital * LEVERAGE) / entry_price
         amount = round_amount(symbol, amount_raw)
         if amount <= 0: return
@@ -1476,9 +1490,13 @@ async def process_symbol(symbol, timeframe):
             pattern=pattern, big_high=big_high
         )
 
-        required_margin = CAPITAL_INITIAL
-        if is_double_sure:
+        scheme_for_capital = determine_scheme(eth_trend, side == 'buy', is_reversal, is_double_sure)
+        if scheme_for_capital == 'double_sure':
             required_margin = DOUBLE_SURE_RED_INITIAL_CAPITAL if is_double_sure_red else DOUBLE_SURE_CAPITAL
+        elif scheme_for_capital == 'bullish_long':
+            required_margin = BULLISH_INITIAL_CAPITAL
+        else:
+            required_margin = SIDEWAYS_INITIAL_CAPITAL
 
         # Build a minimal trade-shaped dict (no entries actually filled) so we
         # can reuse compute_projected_tps for the "TP after DCA1/DCA2" chain,

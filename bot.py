@@ -1337,6 +1337,17 @@ async def process_symbol(symbol, timeframe):
                 )
             is_reversal = True
 
+        # ==========================
+        # 30m / 1h: DOUBLE SURE BET ONLY
+        # ==========================
+        # Rising/Falling Three continuation & reversal signals (bullish_long,
+        # sideways schemes) still only trade on 5m/15m as before. 30m/1h
+        # candles are scanned purely to catch Double Sure Bets - any other
+        # signal on those timeframes is silently skipped.
+        if timeframe in ('30m', '1h') and not is_double_sure:
+            logging.info(f"{symbol} rejected - {timeframe} non-double-sure signal")
+            return
+
 # ==========================
 # ETH FILTER (bypassed entirely for a Double Sure Bet)
 # ==========================

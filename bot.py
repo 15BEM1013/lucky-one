@@ -16,7 +16,12 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TIMEFRAMES = ['5m', '15m']
+TIMEFRAMES = ['5m', '15m', '30m', '1h']
+# How often each timeframe's candle actually closes, in minutes. scan_loop
+# uses this to only scan a timeframe on the tick where its candle has just
+# closed (e.g. 30m every 6th tick, 1h every 12th tick) instead of re-fetching
+# it on every 5-min tick.
+TF_INTERVAL_MINUTES = {'5m': 5, '15m': 15, '30m': 30, '1h': 60}
 CANDLE_LIMIT = 12
 MIN_BIG_BODY_PCT = 1.0
 MAX_SMALL_BODY_PCT = 0.1
@@ -1565,7 +1570,15 @@ async def scan_loop(symbols):
         logging.info(f"Next scan in ~{sleep_sec//60} min")
         await asyncio.sleep(sleep_sec)
 
-        for tf in TIMEFRAMES:
+        # Every tick is a 5-min mark, but 30m/1h candles only close every
+        # 6th/12th tick. Only scan a timeframe when its candle has actually
+        # just closed, so 30m/1h don't get hit with wasted API calls every
+        # 5 minutes for no new data.
+        now = get_ist_time()
+        minute_of_day = now.hour * 60 + now.minute
+        due_tfs = [tf for tf in TIMEFRAMES if minute_of_day % TF_INTERVAL_MINUTES[tf] == 0]
+
+        for tf in due_tfs:
             logging.info(f"Scanning {tf}")
             chunk_size = math.ceil(len(symbols) / NUM_CHUNKS)
             chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
@@ -1573,7 +1586,7 @@ async def scan_loop(symbols):
                 await process_batch(chunk, tf)
                 if i < len(chunks) - 1:
                     await asyncio.sleep(BATCH_DELAY)
-        logging.info("Full scan completed")
+        logging.info(f"Scan completed for: {due_tfs}")
 
 def get_next_candle_close():
     now = get_ist_time()

@@ -647,9 +647,9 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
         dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
         sl_reference_price = ref_price
 
-    # Special case: Double Sure BET, RED candle (BUY), Falling Three pattern
-    # -> TP1 is the big candle's high price instead of a fixed % target.
-    if is_double_sure and is_double_sure_red and pattern == 'Falling Three' and big_high is not None:
+    # Double Sure BET, RED candle (BUY): TP is always the big candle's high
+    # price, for every pattern (not just Falling Three) and at every stage.
+    if is_double_sure and is_double_sure_red and big_high is not None:
         tp = big_high
     else:
         tp = ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct)
@@ -717,19 +717,23 @@ def compute_projected_tps(sym, tr):
 
     if cum_amount > 0:
         avg1 = cum_weighted / cum_amount
+        big_high = tr.get('big_high')
 
-        if scheme == 'double_sure_dump':
-            tp_pct1 = DS_DUMP_TP_PCT
-        elif scheme == 'double_sure_flip_long':
-            tp_pct1 = DS_FLIP_LONG_TP_PCT
-        elif scheme == 'double_sure':
-            tp_pct1 = DOUBLE_SURE_RED_TP_AFTER_DCA1 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA1
-        elif scheme == 'bullish_long':
-            tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT
+        if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
+            tp1 = big_high
         else:
-            tp_pct1 = SIDEWAYS_TP_AFTER_DCA1_PCT
+            if scheme == 'double_sure_dump':
+                tp_pct1 = DS_DUMP_TP_PCT
+            elif scheme == 'double_sure_flip_long':
+                tp_pct1 = DS_FLIP_LONG_TP_PCT
+            elif scheme == 'double_sure':
+                tp_pct1 = DOUBLE_SURE_GREEN_TP_AFTER_DCA1
+            elif scheme == 'bullish_long':
+                tp_pct1 = BULLISH_TP_AFTER_DCA1_PCT
+            else:
+                tp_pct1 = SIDEWAYS_TP_AFTER_DCA1_PCT
+            tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
 
-        tp1 = avg1 * (1 + tp_pct1) if is_long else avg1 * (1 - tp_pct1)
         result['after_dca1'] = round_price(sym, tp1)
         result['dca1_filled'] = dca_stage >= 1
 
@@ -741,7 +745,7 @@ def compute_projected_tps(sym, tr):
             tp_pct2 = DS_DUMP_TP_PCT
         elif scheme == 'double_sure':
             dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
-            tp_pct2 = DOUBLE_SURE_RED_TP_AFTER_DCA2 if is_double_sure_red else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
+            tp_pct2 = DOUBLE_SURE_GREEN_TP_AFTER_DCA2  # unused when RED (big_high override below)
         else:
             dca2_capital = SIDEWAYS_DCA2_CAPITAL
             tp_pct2 = SIDEWAYS_TP_AFTER_DCA2_PCT
@@ -756,8 +760,12 @@ def compute_projected_tps(sym, tr):
             cum_weighted2 = cum_weighted + dca2_level * dca2_amount
 
         if cum_amount2 > 0:
-            avg2 = cum_weighted2 / cum_amount2
-            tp2 = avg2 * (1 + tp_pct2) if is_long else avg2 * (1 - tp_pct2)
+            big_high = tr.get('big_high')
+            if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
+                tp2 = big_high
+            else:
+                avg2 = cum_weighted2 / cum_amount2
+                tp2 = avg2 * (1 + tp_pct2) if is_long else avg2 * (1 - tp_pct2)
             result['after_dca2'] = round_price(sym, tp2)
             result['dca2_filled'] = dca_stage >= 2
 
@@ -1005,13 +1013,17 @@ async def handle_dca_filled(sym, tr, order, stage):
             tp_pct = BULLISH_TP_AFTER_DCA1_PCT
         elif scheme == 'double_sure':
             if is_double_sure_red:
-                tp_pct = DOUBLE_SURE_RED_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_RED_TP_AFTER_DCA2
+                tp_pct = None  # unused - TP is fixed at big_high, see below
             else:
                 tp_pct = DOUBLE_SURE_GREEN_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
         else:
             tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if stage == 1 else SIDEWAYS_TP_AFTER_DCA2_PCT
 
-        new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
+        big_high = tr.get('big_high')
+        if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
+            new_tp = round_price(sym, big_high)
+        else:
+            new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
         tr['tp'] = new_tp
 
         # replace the resting TP order to cover the new average / full size
@@ -1435,10 +1447,11 @@ async def process_symbol(symbol, timeframe):
                     is_double_sure_dump = True
                     signal_msg += f" | 🌊 Huge Dump Incoming (24h {day_change_pct:+.1f}%)"
                 elif day_change_pct < 0:
-                    if pattern == 'Rising Three' and eth_trend == "BEARISH":
-                        # Rising Three + ETH bearish: SELL only, no flip to LONG
+                    if eth_trend == "BEARISH":
+                        # ETH bearish: SELL only, no flip to LONG
                         signal_msg += f" | ETH Bearish → SELL only (24h {day_change_pct:+.1f}%)"
                     else:
+                        # ETH bullish or sideways: flip the SELL to a LONG
                         is_double_sure_flip_long = True
                         side = 'buy'
                         signal_msg += f" | 🔄 Flipped to LONG (24h {day_change_pct:+.1f}%)"
@@ -1462,11 +1475,9 @@ async def process_symbol(symbol, timeframe):
 
         elif eth_trend == "BULLISH":
 
-            # Rising continuation
+            # Rising continuation only - the reversal SELL case (which used
+            # the 'sideways' scheme) is rejected now, it was losing money.
             if pattern == "Rising Three" and not is_reversal:
-                pass
-
-            elif pattern == "Rising Three" and is_reversal:
                 pass
 
             else:
@@ -1597,6 +1608,7 @@ async def process_symbol(symbol, timeframe):
             'is_reversal': is_reversal,
             'dca_scheme': dca_scheme,
             'sl_reference_price': sl_reference_price,
+            'big_high': big_high,
             'dca1_level': dca1_level,
             'dca2_level': dca2_level,  # None for bullish_long scheme
             'tp_order_id': tp_order['id'] if tp_order else None,
@@ -1659,6 +1671,7 @@ async def process_symbol(symbol, timeframe):
             'dca1_level': dca1_level,
             'dca2_level': dca2_level,
             'is_double_sure_red': is_double_sure_red,
+            'big_high': big_high,
         }
         projected = compute_projected_tps(symbol, temp_tr)
 

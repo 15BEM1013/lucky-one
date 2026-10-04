@@ -70,6 +70,9 @@ DOUBLE_SURE_GREEN_DCA2_TRIGGER_PCT = 3.0 / 100
 DOUBLE_SURE_GREEN_DCA2_CAPITAL = 20.0
 
 # --- RED Candle (BUY) - Different structure ---
+# TP for this case is always the red big candle's OPEN price (every stage:
+# initial, after DCA1, after DCA2) - the percentage TPs below are only
+# kept for reference / fallback and are not used for TP placement.
 DOUBLE_SURE_RED_INITIAL_CAPITAL = 40.0   # initial entry margin for RED/BUY case
 DOUBLE_SURE_RED_TP_INITIAL = 1.5 / 100
 DOUBLE_SURE_RED_DCA1_TRIGGER_PCT = 1.0 / 100
@@ -99,6 +102,9 @@ DS_FLIP_LONG_CAPITAL = 30.0
 DS_FLIP_LONG_DCA1_CAPITAL = 60.0
 
 # --- Volatility flag thresholds ---
+# Any signal flagged as HIGH VOLATILITY or SHARP MOVE is now rejected
+# outright (no trade is opened). Together the two flags cover every signal
+# whose big-candle body % exceeds CANDLE_FLAG_PCT.
 CANDLE_FLAG_PCT = 2.0     # big-candle body % change threshold
 DAY_DANGER_PCT = 10.0     # 24h % change threshold for the "danger" tier
 
@@ -553,27 +559,6 @@ def check_eth_ema_sync(signal_time):
 
     return len(conflicts) == 0, conflicts, last3
 
-def build_eth_sync_reject_message(symbol, side, pattern, last3, conflicts):
-    lines = ["━━━━━━━━━━━━━━━", "🚫 EMA SYNC FILTER REJECTED", "━━━━━━━━━━━━━━━"]
-    lines.append(f"{'🟢 LONG' if side == 'buy' else '🔴 SHORT'} {symbol}")
-    lines.append(f"🔍 Pattern: {pattern}")
-    lines.append("")
-    lines.append("Last 3 ETH FILTER snapshots:")
-    for h in last3:
-        t = datetime.fromtimestamp(h['time'] / 1000, pytz.timezone('Asia/Kolkata')).strftime('%H:%M')
-        lines.append(f"{t} — EMA9: {h['ema9']:.2f} | EMA21: {h['ema21']:.2f}")
-    lines.append("")
-    conflict_lines = [f"Transition {idx + 1}→{idx + 2}: EMA9 {dir9} vs EMA21 {dir21} (opposite)" for idx, dir9, dir21 in conflicts]
-    lines.append("⚠️ " + " | ".join(conflict_lines))
-    return "\n".join(lines)
-
-def build_sideways_reject_message(symbol, pattern):
-    lines = ["━━━━━━━━━━━━━━━", "🚫 SIDEWAYS FILTER REJECTED", "━━━━━━━━━━━━━━━"]
-    lines.append(f"{symbol}")
-    lines.append(f"🔍 Pattern: {pattern} (Continuation)")
-    lines.append("ETH trend: SIDEWAYS — no longer traded")
-    return "\n".join(lines)
-
 # === TREND-BASED TRADE PLAN ===
 def determine_scheme(eth_trend_now, is_long, is_reversal, is_double_sure, is_double_sure_dump=False, is_double_sure_flip_long=False):
     """
@@ -601,9 +586,9 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
 
     Three schemes:
       - 'double_sure': the double-wick / big-candle override SHORT/BUY.
-        Color-dependent TP structure. For the RED-candle (BUY) case on a
-        Falling Three pattern, the initial TP1 is the big candle's high
-        price instead of a fixed percentage.
+        Color-dependent TP structure. For the RED-candle (BUY) case (always
+        a Falling Three), TP is the red big candle's OPEN price at every
+        stage (initial, after DCA1, after DCA2).
       - 'bullish_long': ETH-bullish trend, continuation LONG (Rising Three,
         non-reversal, buy side) only.
       - 'sideways': everything else that reaches this point.
@@ -647,10 +632,10 @@ def compute_trade_plan(symbol, eth_trend_now, side, is_reversal, big_open, ref_p
         dca2_level = ref_price * (1 - SIDEWAYS_DCA2_TRIGGER_PCT) if is_long else ref_price * (1 + SIDEWAYS_DCA2_TRIGGER_PCT)
         sl_reference_price = ref_price
 
-    # Double Sure BET, RED candle (BUY): TP is always the big candle's high
-    # price, for every pattern (not just Falling Three) and at every stage.
-    if is_double_sure and is_double_sure_red and big_high is not None:
-        tp = big_high
+    # Double Sure BET, RED candle (BUY, Falling Three): TP is always the red
+    # big candle's OPEN price, at every stage.
+    if is_double_sure and is_double_sure_red and big_open is not None:
+        tp = big_open
     else:
         tp = ref_price * (1 + tp_pct) if is_long else ref_price * (1 - tp_pct)
 
@@ -683,6 +668,11 @@ def compute_projected_tps(sym, tr):
     dca_stage = tr.get('dca_stage', 0)
     is_double_sure_red = tr.get('is_double_sure_red', False)
     leverage = leverage_for_scheme(scheme)
+
+    # Double Sure RED/BUY TP target = red big candle's open price.
+    # (falls back to big_high for trades opened before this change, so they
+    # keep working after a restart)
+    red_tp_target = tr.get('big_open', tr.get('big_high'))
 
     # Original TP, fixed at trade creation — never touched by handle_dca_filled
     result = {'initial': tr.get('tp_initial', tr['tp'])}
@@ -717,10 +707,9 @@ def compute_projected_tps(sym, tr):
 
     if cum_amount > 0:
         avg1 = cum_weighted / cum_amount
-        big_high = tr.get('big_high')
 
-        if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
-            tp1 = big_high
+        if scheme == 'double_sure' and is_double_sure_red and red_tp_target is not None:
+            tp1 = red_tp_target
         else:
             if scheme == 'double_sure_dump':
                 tp_pct1 = DS_DUMP_TP_PCT
@@ -745,7 +734,7 @@ def compute_projected_tps(sym, tr):
             tp_pct2 = DS_DUMP_TP_PCT
         elif scheme == 'double_sure':
             dca2_capital = DOUBLE_SURE_RED_DCA2_CAPITAL if is_double_sure_red else DOUBLE_SURE_GREEN_DCA2_CAPITAL
-            tp_pct2 = DOUBLE_SURE_GREEN_TP_AFTER_DCA2  # unused when RED (big_high override below)
+            tp_pct2 = DOUBLE_SURE_GREEN_TP_AFTER_DCA2  # unused when RED (red candle open override below)
         else:
             dca2_capital = SIDEWAYS_DCA2_CAPITAL
             tp_pct2 = SIDEWAYS_TP_AFTER_DCA2_PCT
@@ -760,9 +749,8 @@ def compute_projected_tps(sym, tr):
             cum_weighted2 = cum_weighted + dca2_level * dca2_amount
 
         if cum_amount2 > 0:
-            big_high = tr.get('big_high')
-            if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
-                tp2 = big_high
+            if scheme == 'double_sure' and is_double_sure_red and red_tp_target is not None:
+                tp2 = red_tp_target
             else:
                 avg2 = cum_weighted2 / cum_amount2
                 tp2 = avg2 * (1 + tp_pct2) if is_long else avg2 * (1 - tp_pct2)
@@ -1013,15 +1001,17 @@ async def handle_dca_filled(sym, tr, order, stage):
             tp_pct = BULLISH_TP_AFTER_DCA1_PCT
         elif scheme == 'double_sure':
             if is_double_sure_red:
-                tp_pct = None  # unused - TP is fixed at big_high, see below
+                tp_pct = None  # unused - TP is fixed at the red candle's open, see below
             else:
                 tp_pct = DOUBLE_SURE_GREEN_TP_AFTER_DCA1 if stage == 1 else DOUBLE_SURE_GREEN_TP_AFTER_DCA2
         else:
             tp_pct = SIDEWAYS_TP_AFTER_DCA1_PCT if stage == 1 else SIDEWAYS_TP_AFTER_DCA2_PCT
 
-        big_high = tr.get('big_high')
-        if scheme == 'double_sure' and is_double_sure_red and big_high is not None:
-            new_tp = round_price(sym, big_high)
+        # Double Sure RED/BUY: TP = red big candle's open price (falls back
+        # to big_high only for trades opened before this change).
+        red_tp_target = tr.get('big_open', tr.get('big_high'))
+        if scheme == 'double_sure' and is_double_sure_red and red_tp_target is not None:
+            new_tp = round_price(sym, red_tp_target)
         else:
             new_tp = round_price(sym, avg_entry * (1 + tp_pct) if is_long else avg_entry * (1 - tp_pct))
         tr['tp'] = new_tp
@@ -1147,6 +1137,7 @@ async def close_trade(sym, hit_type, exit_price):
 async def update_eth_trend():
 
     global eth_trend
+    global eth_phase
     global eth_last_candle
     global eth_market_phases
     global eth_phase_text
@@ -1470,6 +1461,7 @@ async def process_symbol(symbol, timeframe):
 # ==========================
 # ETH FILTER (bypassed entirely for a Double Sure Bet)
 # ==========================
+# NOTE: every rejection below is log-only - nothing is sent to Telegram.
         if is_double_sure:
             pass
 
@@ -1487,9 +1479,7 @@ async def process_symbol(symbol, timeframe):
         elif eth_trend == "SIDEWAYS":
 
             if pattern == "Rising Three" and not is_reversal:
-                reject_msg = build_sideways_reject_message(symbol, pattern)
-                await send_telegram(reject_msg)
-                logging.info(f"{symbol} rejected - Sideways (Rising Three continuation, reported)")
+                logging.info(f"{symbol} rejected - Sideways (Rising Three continuation)")
             else:
                 logging.info(f"{symbol} rejected - Sideways")
             return
@@ -1500,16 +1490,12 @@ async def process_symbol(symbol, timeframe):
             return
 
         # ==========================
-        # ETH EMA SYNC FILTER (new)
+        # ETH EMA SYNC FILTER
         # ==========================
         # Applies to every signal that reaches this point (including Double
-        # Sure Bets). Unlike the trend filter above, a rejection here IS
-        # reported to Telegram - every other rejection above stays silent
-        # (log-only), same as before.
+        # Sure Bets). Rejections are log-only (no Telegram message).
         sync_passed, sync_conflicts, sync_snapshots = check_eth_ema_sync(signal_time)
         if not sync_passed:
-            reject_msg = build_eth_sync_reject_message(symbol, side, pattern, sync_snapshots, sync_conflicts)
-            await send_telegram(reject_msg)
             logging.info(f"{symbol} rejected - EMA sync filter")
             return
 
@@ -1525,6 +1511,16 @@ async def process_symbol(symbol, timeframe):
 
         is_danger = abs(candle_change_pct) > CANDLE_FLAG_PCT and abs(day_change_pct) > DAY_DANGER_PCT
         is_caution = abs(candle_change_pct) > CANDLE_FLAG_PCT and not is_danger
+
+        # ==========================
+        # VOLATILITY REJECTION (all cases)
+        # ==========================
+        # HIGH VOLATILITY and SHARP MOVE signals are never traded, regardless
+        # of scheme (including Double Sure Bets). Log-only, no Telegram.
+        if is_danger or is_caution:
+            logging.info(f"{symbol} rejected - {'high volatility' if is_danger else 'sharp move'} "
+                         f"(candle {candle_change_pct:.2f}%, 24h {day_change_pct:+.2f}%)")
+            return
 
         # Reuse the just-closed signal candle's close instead of an extra fetch_ticker
         # round-trip - cuts latency between signal detection and order placement.
@@ -1608,6 +1604,7 @@ async def process_symbol(symbol, timeframe):
             'is_reversal': is_reversal,
             'dca_scheme': dca_scheme,
             'sl_reference_price': sl_reference_price,
+            'big_open': big_open,   # Double Sure RED/BUY TP target (red big candle's open)
             'big_high': big_high,
             'dca1_level': dca1_level,
             'dca2_level': dca2_level,  # None for bullish_long scheme
@@ -1671,6 +1668,7 @@ async def process_symbol(symbol, timeframe):
             'dca1_level': dca1_level,
             'dca2_level': dca2_level,
             'is_double_sure_red': is_double_sure_red,
+            'big_open': big_open,
             'big_high': big_high,
         }
         projected = compute_projected_tps(symbol, temp_tr)
